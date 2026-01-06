@@ -240,17 +240,28 @@ class PhysicsHead(nn.Module):
         poly_stack: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply polynomial coefficients to compute A₁ and A₂.
+        Compute A₁ and A₂ line integral maps via polynomial dot product.
         
-        This is essentially a 1x1 convolution with learned weights,
-        but we implement it explicitly for clarity.
+        This applies the learned polynomial coefficients to the feature stack
+        to produce the Alvarez-Macovski basis decomposition. Mathematically:
+        
+            A₁[x,y] = Σᵢ coeffs_a1[i] · poly_stack[i, x, y]
+            A₂[x,y] = Σᵢ coeffs_a2[i] · poly_stack[i, x, y]
+        
+        This is equivalent to a 1x1 convolution with learned weights,
+        but implemented explicitly for clarity.
         
         Args:
             poly_stack: Polynomial features (B, num_terms, H, W)
+                        Contains [1, L, H, L², LH, H²] for each pixel
             
         Returns:
-            A1: Photoelectric coefficient map (B, 1, H, W)
-            A2: Compton coefficient map (B, 1, H, W)
+            A1: Photoelectric line integral map (B, 1, H, W) - NOT the coefficients!
+            A2: Compton line integral map (B, 1, H, W) - NOT the coefficients!
+            
+        Note:
+            The "coefficients" (coeffs_a1, coeffs_a2) are the polynomial WEIGHTS.
+            The outputs (A₁, A₂) are the computed line integrals for each pixel.
         """
         # Reshape coefficients for broadcasting: (num_terms,) -> (1, num_terms, 1, 1)
         c1 = self.coeffs_a1.view(1, -1, 1, 1)
@@ -524,6 +535,7 @@ if __name__ == "__main__":
     L_high = torch.ones(1, 1, H, W) * 1.8
     
     # Right half is different material (higher ratio)
+    # Boundary is at x = W//2 = 32
     L_low[:, :, :, W//2:] = 3.5
     L_high[:, :, :, W//2:] = 2.0
     
@@ -533,16 +545,21 @@ if __name__ == "__main__":
     grad_R = boundary_out[0, 3]  # Channel 3 is ratio gradient
     
     # Check gradient at boundary vs interior
-    interior_grad = grad_R[H//2, W//4].item()  # Left side interior
-    boundary_grad = grad_R[H//2, W//2].item()  # At boundary
+    # NOTE: The forward difference grad[x] = |R[x+1] - R[x]| means:
+    #   - The boundary at x=32 produces gradient at x=31 (one pixel LEFT of boundary)
+    #   - grad[31] = |R[32] - R[31]| = |1.75 - 1.111| = 0.639 (the actual edge)
+    #   - grad[32] = |R[33] - R[32]| = |1.75 - 1.75| = 0 (already past the edge)
+    interior_grad = grad_R[H//2, W//4].item()      # Left side interior (x=16)
+    boundary_grad = grad_R[H//2, W//2 - 1].item()  # One pixel before boundary (x=31)
     
-    print(f"  Interior gradient: {interior_grad:.4f}")
-    print(f"  Boundary gradient: {boundary_grad:.4f}")
+    print(f"  Interior gradient (x=16): {interior_grad:.4f}")
+    print(f"  Boundary gradient (x=31): {boundary_grad:.4f}")
     
-    if boundary_grad > interior_grad * 5:
+    if boundary_grad > 0.1 and boundary_grad > interior_grad * 5:
         print("  ✓ Boundary has significantly higher gradient (edge detection works!)")
     else:
-        print("  ✗ WARNING: Boundary gradient should be much higher than interior")
+        print(f"  ✗ WARNING: Boundary gradient should be much higher than interior")
+        print(f"      Expected boundary_grad > 0.1, got {boundary_grad:.4f}")
     
     # -------------------------------------------------------------------------
     # Test 4: Non-negativity Constraint
