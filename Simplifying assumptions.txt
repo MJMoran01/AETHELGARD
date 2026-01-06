@@ -1,0 +1,5 @@
+unadressed simplifying assumptions: 
+* single-point photon source in X-rays:
+	- detector is plane, source is point. => pixels do not represent pefectly orthogonal 
+* Ignoring detector sensitivity in the polychromatic beer-lambert equation - harms transferability,
+  but fine for HUMS-exclusive scanner

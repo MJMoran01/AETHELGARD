@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# PyTorch
+*.pth
+*.pt
+checkpoints/
+
+# Data files (too large for git)
+# Keep the dataset structure but not the actual images
+HUMS-X-ray-Dataset/HighLow/*.tif
+HUMS-X-ray-Dataset/NotThreats/*.png
+HUMS-X-ray-Dataset/NotThreats/*.jpg
+HUMS-X-ray-Dataset/ThreatsRGB/*.png
+HUMS-X-ray-Dataset/ThreatsRGB/*.jpg
+
+# Output files (regenerable)
+outputs/*.png
+outputs/*.jpg
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
