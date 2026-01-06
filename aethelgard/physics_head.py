@@ -749,7 +749,8 @@ class PhysicsHead(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        return_intermediate: bool = False
+        return_intermediate: bool = False,
+        return_debug: bool = False
     ) -> torch.Tensor:
         """
         Forward pass: Dual-energy log-attenuation → Physics feature maps.
@@ -759,6 +760,7 @@ class PhysicsHead(nn.Module):
                Channel 0: L_low (low energy log-attenuation)
                Channel 1: L_high (high energy log-attenuation)
             return_intermediate: If True, also return polynomial stack (for debugging)
+            return_debug: If True, return detailed debug dict with all intermediate states
             
         Returns:
             physics_maps: Output tensor (B, 4, H, W)
@@ -766,6 +768,16 @@ class PhysicsHead(nn.Module):
                Channel 1: A₂ (Compton coefficient)
                Channel 2: Z_eff (Effective atomic number)
                Channel 3: ∇R (Ratio gradient - material edge detector)
+               
+            If return_debug=True, also returns debug_dict containing:
+                - 'L_low': Input low energy log-attenuation
+                - 'L_high': Input high energy log-attenuation  
+                - 'poly_stack': Polynomial feature stack
+                - 'A1': Photoelectric coefficient (after ReLU)
+                - 'A2': Compton coefficient (after ReLU)
+                - 'Z_eff': Effective atomic number
+                - 'grad_R': Ratio gradient
+                - 'ratio_map': The R = L_low/L_high map (thickness-invariant)
         """
         # Split input channels
         L_low = x[:, 0:1, :, :]   # (B, 1, H, W)
@@ -783,6 +795,21 @@ class PhysicsHead(nn.Module):
         
         # Concatenate all physics features
         physics_maps = torch.cat([A1, A2, Z_eff, grad_R], dim=1)
+        
+        if return_debug:
+            # Compute the ratio map for debug visualization
+            ratio_map = L_low / (L_high + self.epsilon)
+            debug_dict = {
+                'L_low': L_low,
+                'L_high': L_high,
+                'poly_stack': poly_stack,
+                'A1': A1,
+                'A2': A2,
+                'Z_eff': Z_eff,
+                'grad_R': grad_R,
+                'ratio_map': ratio_map,
+            }
+            return physics_maps, debug_dict
         
         if return_intermediate:
             return physics_maps, poly_stack

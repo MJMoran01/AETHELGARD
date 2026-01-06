@@ -260,7 +260,11 @@ class RawToLogAttenuation(nn.Module):
         else:
             raise ValueError(f"Unknown i0_method: {self.i0_method}")
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor,
+        return_debug: bool = False
+    ) -> torch.Tensor:
         """
         Convert raw intensity to log-attenuation.
         
@@ -275,18 +279,32 @@ class RawToLogAttenuation(nn.Module):
             x: Raw intensity tensor (B, 2, H, W) dtype=float32
                Channel 0: Low energy image
                Channel 1: High energy image
+            return_debug: If True, also return debug_dict with intermediate states
                
         Returns:
             Log-attenuation tensor (B, 2, H, W)
             L = -ln(I/I_0), where L ≥ 0 for physical materials
+            
+            If return_debug=True, also returns debug_dict containing:
+                - 'raw_input': Original input before any processing
+                - 'after_blur': After Gaussian blur, before log transform
+                - 'i0_estimated': Estimated incident intensity
+                - 'transmission': T = I/I_0 before clamping
+                - 'transmission_clamped': T after clamping to [epsilon, 1]
         """
         # Ensure float32 for numerical stability
         x = x.float()
+        
+        # Store raw input for debug
+        raw_input = x.clone() if return_debug else None
         
         # Step 1: Gaussian blur BEFORE log transform
         # This averages out Poisson shot noise while still in linear space,
         # before the log transform amplifies noise in low-intensity regions.
         x = self._apply_gaussian_blur(x)
+        
+        # Store after blur for debug (this is the "denoised" state)
+        after_blur = x.clone() if return_debug else None
         
         # Step 2: Estimate I_0
         i0 = self.estimate_i0(x)
@@ -294,6 +312,9 @@ class RawToLogAttenuation(nn.Module):
         # Step 3: Compute transmission ratio T = I / I_0
         # Add epsilon to I_0 to prevent division by zero if image is all black
         transmission = x / (i0 + self.epsilon)
+        
+        # Store transmission before clamping for debug
+        transmission_pre_clamp = transmission.clone() if return_debug else None
         
         # Step 4: Clamp transmission to physically valid range
         # T > 1 means more photons detected than incident (unphysical - noise/scatter)
@@ -304,6 +325,16 @@ class RawToLogAttenuation(nn.Module):
         # L = -ln(T) = -ln(I/I_0) = ln(I_0) - ln(I)
         # For T ∈ [epsilon, 1], L ∈ [0, -ln(epsilon)] ≈ [0, 13.8]
         log_attenuation = -torch.log(transmission)
+        
+        if return_debug:
+            debug_dict = {
+                'raw_input': raw_input,
+                'after_blur': after_blur,
+                'i0_estimated': i0,
+                'transmission': transmission_pre_clamp,
+                'transmission_clamped': transmission,
+            }
+            return log_attenuation, debug_dict
         
         return log_attenuation
     
