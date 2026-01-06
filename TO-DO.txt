@@ -1,0 +1,1 @@
+Optimize polynomial coefficients via backprop instead of using initialized guesses.
