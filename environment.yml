@@ -1,0 +1,45 @@
+# Project AETHELGARD Conda Environment
+# Physics-Gated Attention Network for Dual-Energy X-Ray Security Imaging
+#
+# To create this environment:
+#   conda env create -f environment.yml
+#
+# To activate:
+#   conda activate AETHEL
+#
+# Note: PyTorch is installed separately via pip for CPU/GPU flexibility.
+# After creating the environment, run one of:
+#
+#   CPU only:
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+#
+#   CUDA 11.8:
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#
+#   CUDA 12.1:
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+name: AETHEL
+
+channels:
+  - defaults
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip>=23.0
+  
+  # Scientific computing
+  - numpy>=1.23
+  - scipy>=1.10
+  
+  # Visualization
+  - matplotlib>=3.7
+  
+  # Image processing
+  - pillow>=9.0
+  
+  # pip dependencies
+  - pip:
+    - tifffile>=2023.0
+    # PyTorch installed separately - see note above
