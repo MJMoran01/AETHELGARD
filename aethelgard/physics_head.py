@@ -498,9 +498,19 @@ class ASpaceNoiseFilter:
 # The module stores its scalars as float32 tensors, so "finite in Python"
 # is not the property that matters: 1e39 is a perfectly finite Python float
 # that becomes inf on conversion, and 1e-50 becomes exactly zero. Validate
-# against the representable float32 range instead.
+# against the usable float32 range instead.
+#
+# _FLOAT32_SMALLEST_NORMAL is np.finfo(np.float32).tiny, the smallest
+# positive NORMAL float32 - not the smallest representable one. Values below
+# it (1e-40, say) are still representable as subnormals rather than becoming
+# zero, so rejecting them is a deliberate choice, not a claim that they
+# underflow: subnormals lose mantissa bits as they shrink, and several
+# backends (and most GPU fast-math paths) flush them to zero anyway, so a
+# guard constant living down there would silently mean something different
+# per device. This module needs its epsilon and floor to mean the same thing
+# everywhere, so the normal range is the supported range.
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
-_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+_FLOAT32_SMALLEST_NORMAL = float(np.finfo(np.float32).tiny)
 
 
 def _check_float32_scalar(name: str, value: float, positive: bool = True) -> float:
@@ -520,10 +530,12 @@ def _check_float32_scalar(name: str, value: float, positive: bool = True) -> flo
         raise ValueError(
             f"{name}={value} overflows float32 (limit {_FLOAT32_MAX:g})"
         )
-    if value != 0.0 and abs(value) < _FLOAT32_TINY:
+    if value != 0.0 and abs(value) < _FLOAT32_SMALLEST_NORMAL:
         raise ValueError(
-            f"{name}={value} underflows to zero in float32 "
-            f"(smallest normal {_FLOAT32_TINY:g})"
+            f"{name}={value} is subnormal in float32 and is rejected as "
+            "device-dependent (smallest supported magnitude "
+            f"{_FLOAT32_SMALLEST_NORMAL:g}); it is representable, but see "
+            "the note on the module constants"
         )
     return value
 
@@ -660,6 +672,20 @@ class PhysicsHead(nn.Module):
         # value is about to become a float32 tensor.
         _check_float32_scalar("z_scale", z_scale)
         _check_float32_scalar("z_offset", z_offset, positive=False)
+        # Individually representable is not enough: Z_eff = z_scale * z_raw +
+        # z_offset, so at the reference point z_raw = 1 (A1 == A2, an entirely
+        # ordinary pixel) the SUM has to be representable too - two separately
+        # legal float32 maxima overflow to inf together. This bounds the
+        # CONFIGURATION, which is what a constructor can bound. It does not
+        # bound the data: a large enough A1/A2 overflows any finite scale, and
+        # that is an input problem this module has no more defense against
+        # than it does against an A1 of 1e30.
+        if z_scale + abs(z_offset) > _FLOAT32_MAX:
+            raise ValueError(
+                f"z_scale ({z_scale}) + |z_offset| ({abs(z_offset)}) overflows "
+                f"float32 (limit {_FLOAT32_MAX:g}); Z_eff would be inf for any "
+                "pixel with A1 >= A2"
+            )
         z_scale_raw = _inverse_softplus(torch.tensor(float(z_scale)))
         z_offset_tensor = torch.tensor(float(z_offset))
         
