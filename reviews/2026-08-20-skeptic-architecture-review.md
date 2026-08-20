@@ -201,9 +201,9 @@ pixel, but at different points in the pipeline: the PyTorch preprocessor
 estimates I0 from the **blurred** signal, while `DualEnergyDataset`
 (`dataset.py:174-184`) uses the **unblurred** loaded arrays directly. Both
 are per-image-relative regardless of the blur-timing difference: L, A1,
-A2, and Z_eff all end up **image-relative** quantities. A "Z_eff = 10.4"
-from one image and another
-are not on the same scale (fails if any image lacks clean air, saturates,
+A2, and Z_eff all end up **image-relative** quantities. A `Z_eff` value of
+10.4 in one image is therefore not directly comparable with a value from
+another image (fails if any image lacks clean air, saturates,
 or has hot pixels under `per_image_max`). The design doc's own
 self-calibration section (Section 6.2) proposes belt/air anchoring instead;
 the implemented shortcut was never surfaced as a decision. Also directly
@@ -244,6 +244,7 @@ concrete instances.**
    visible consequence. Constants `mad_multiplier=3.0`,
    `subsample_threshold=100000`, and the theta bounds (see 4a) are
    unexplained.
+3. **The unit "tests" are not Tier-1 instruments.** `physics_head.py`'s
    `__main__` (Tests 2, 3, 4, 6, 7, 8) prints a warning symbol on failure
    but **never asserts** — the script exits 0 regardless of whether salt
    beats sugar or the rivet survives. Only `preprocessing.py:487-489` and
