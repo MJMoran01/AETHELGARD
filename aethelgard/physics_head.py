@@ -59,6 +59,8 @@ Author: Michael Moran
 Supervisor: Dr. Thomas Anthony, CTO, Analytical AI
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -325,6 +327,8 @@ class ASpaceNoiseFilter:
                 "max_knn_distance": 0.0,
                 "n_tree_points": n_tree,
                 "subsampled": bool(n_tree < n_pixels),
+                "n_donors": 0,
+                "donor_fallback": False,
                 "degenerate": True,
             }
             return theta_filtered, r_filtered, stats
@@ -359,6 +363,8 @@ class ASpaceNoiseFilter:
 
         outlier_mask = knn_distances > threshold
         n_outliers = int(np.sum(outlier_mask))
+        n_donors = 0
+        donor_fallback = False
 
         if n_outliers > 0:
             # Replacement donors come from the SAME (possibly subsampled)
@@ -367,6 +373,19 @@ class ASpaceNoiseFilter:
             # images that have outliers. When no subsampling occurred tree_idx
             # is every pixel, so this is identical to the previous behaviour.
             donor_idx = tree_idx[~outlier_mask[tree_idx]]
+
+            # Pathological but reachable: EVERY reference-cloud point can be
+            # flagged while non-outliers survive outside the cloud (an
+            # out-of-cloud duplicate of a cloud point scores distance 0,
+            # which a cloud point can never do once its self-match is
+            # discounted). Silently skipping replacement there would leave
+            # known-bad pixels in the output while the diagnostics still
+            # reported outliers, so fall back to the full valid set - and
+            # record that the bound was exceeded rather than hiding it.
+            if len(donor_idx) == 0:
+                donor_idx = np.flatnonzero(~outlier_mask)
+                donor_fallback = bool(len(donor_idx) > 0)
+            n_donors = int(len(donor_idx))
 
             if len(donor_idx) > 0:
                 donor_tree = cKDTree(points[donor_idx])
@@ -389,6 +408,8 @@ class ASpaceNoiseFilter:
             "max_knn_distance": np.max(knn_distances),
             "n_tree_points": n_tree,
             "subsampled": bool(n_tree < n_pixels),
+            "n_donors": n_donors,
+            "donor_fallback": donor_fallback,
             "degenerate": False,
         }
 
@@ -513,8 +534,7 @@ class PhysicsHead(nn.Module):
         learnable: bool = True,
         z_scale: float = 10.0,
         z_offset: float = 0.0,
-        z_signal_threshold: float = 1e-3,
-        z_ratio_floor: float = 1e-2,
+        z_cbrt_grad_max: float = 100.0,
         epsilon: float = 1e-6
     ):
         """
@@ -527,33 +547,40 @@ class PhysicsHead(nn.Module):
                       If False, coefficients are buffers (frozen).
             z_scale: Scaling factor for Z_eff output (helps with interpretability)
             z_offset: Offset for Z_eff output
-            z_signal_threshold: Low-signal mask threshold on A2 (Compton).
-                A2 is proportional to electron density, so A2 at or below
-                this level is air/noise rather than material, and the
-                ratio A1/A2 that Z_eff is built from carries no
-                information there. Those pixels report z_offset and
-                contribute no gradient. This is a numerical-validity
-                guard, NOT a calibrated physical threshold.
-            z_ratio_floor: Ratio below which the cube root d(r^(1/3))/dr
-                is replaced by a bounded linear segment (see
-                _compute_z_effective). Also a numerical guard, not a
-                calibration constant.
+            z_cbrt_grad_max: Largest permitted slope of the cube root used
+                for Z_eff. d(r^(1/3))/dr diverges as r -> 0, so below a
+                floor the cube root is replaced by a straight line whose
+                slope is exactly this value; the floor is DERIVED from it
+                as z_cbrt_grad_max^(-3/2) rather than being a second free
+                constant (see _compute_z_effective). The default of 100
+                puts that floor at 1e-3, i.e. the linear segment covers
+                exactly the region below z_raw = 0.1 -> Z_eff = 1 at the
+                default z_scale: below hydrogen, the lowest element that
+                exists, so the guard can only ever reshape a region that
+                is already physically empty. Nothing is calibrated here.
+                The low-signal mask that goes with it introduces no new
+                constant at all: it reuses `epsilon` (below).
             epsilon: Small constant for numerical stability (prevents division by zero)
         """
         super().__init__()
         
         self.order = order
         self.epsilon = epsilon
-        if z_signal_threshold <= 0.0:
+        # Scalar validation uses math.isfinite, not a bare comparison: NaN
+        # fails every ordering test, so `if x <= 0` waves NaN straight
+        # through and a NaN threshold or floor would silently poison every
+        # downstream map instead of raising here.
+        if not math.isfinite(epsilon) or epsilon <= 0.0:
+            raise ValueError(f"epsilon must be finite and positive, got {epsilon}")
+        if not math.isfinite(z_cbrt_grad_max) or z_cbrt_grad_max <= 0.0:
             raise ValueError(
-                f"z_signal_threshold must be positive, got {z_signal_threshold}"
+                f"z_cbrt_grad_max must be finite and positive, got {z_cbrt_grad_max}"
             )
-        if z_ratio_floor <= 0.0:
-            raise ValueError(
-                f"z_ratio_floor must be positive, got {z_ratio_floor}"
-            )
-        self.z_signal_threshold = z_signal_threshold
-        self.z_ratio_floor = z_ratio_floor
+        self.z_cbrt_grad_max = z_cbrt_grad_max
+        # Derived, not chosen: the linear segment through the origin and
+        # (floor, floor^(1/3)) has slope floor^(-2/3); setting that equal to
+        # z_cbrt_grad_max gives floor = z_cbrt_grad_max^(-3/2).
+        self.z_ratio_floor = z_cbrt_grad_max ** -1.5
         
         # Number of polynomial terms: (n+1)(n+2)/2 for 2D polynomial of order n
         # Order 2: 1 + 2 + 3 = 6 terms
@@ -595,10 +622,13 @@ class PhysicsHead(nn.Module):
         # tracked in issue #3; the default is unchanged here (preserved to
         # float32 round-trip precision through inverse-softplus/softplus).
         # =====================================================================
-        if z_scale <= 0.0:
+        if not math.isfinite(z_scale) or z_scale <= 0.0:
             raise ValueError(
-                f"z_scale must be positive (Z_eff is non-negative), got {z_scale}"
+                "z_scale must be finite and positive (Z_eff is non-negative), "
+                f"got {z_scale}"
             )
+        if not math.isfinite(z_offset):
+            raise ValueError(f"z_offset must be finite, got {z_offset}")
         z_scale_raw = _inverse_softplus(torch.tensor(float(z_scale)))
         z_offset_tensor = torch.tensor(float(z_offset))
         
@@ -795,8 +825,8 @@ class PhysicsHead(nn.Module):
             
         Returns:
             Z_eff: Effective atomic number (B, 1, H, W), scaled for
-                   interpretability, and zero wherever the Compton signal
-                   A2 is below z_signal_threshold (no material, no Z).
+                   interpretability, and exactly zero (offset included)
+                   wherever A2 is numerically zero - no denominator, no Z.
         """
         # -----------------------------------------------------------------
         # THE TRAP: Z_eff is a RATIO feature, and a ratio means nothing where
@@ -810,16 +840,20 @@ class PhysicsHead(nn.Module):
         # way and reported an unboundedly large atomic number.
         #
         # THE FIX (AGENTS.md Glass Box - an explicit mask/clamp, not prose):
-        #   (a) a low-signal MASK on A2: at or below z_signal_threshold there
-        #       is no Compton signal to divide by, so Z_eff is reported as the
-        #       offset and contributes no gradient. This also removes the
-        #       unbounded-Z branch, since a large ratio now requires a real A2.
+        #   (a) a low-signal MASK: where A2 is at or below the module's own
+        #       stability epsilon the denominator is numerically zero, so
+        #       the WHOLE output (offset included) is forced to 0 with no
+        #       gradient. Note what this deliberately does NOT claim: it is
+        #       a numerical-degeneracy test, not a physical air/material
+        #       discrimination, so it introduces no new constant and makes
+        #       no assertion about how the coefficients are scaled. It uses
+        #       exactly the epsilon the old denominator already used.
         #   (b) a gradient CLAMP on the cube root: below z_ratio_floor the cube
         #       root is replaced by the straight line through the origin and
         #       (floor, floor^(1/3)) - identical value at the join, but a
-        #       bounded slope floor^(-2/3) instead of a divergent one.
+        #       slope of exactly z_cbrt_grad_max instead of a divergent one.
         # -----------------------------------------------------------------
-        low_signal = A2 <= self.z_signal_threshold
+        low_signal = A2 <= self.epsilon
 
         # Divide by a safe denominator. The mask discards these entries anyway;
         # this keeps their (meaningless, huge) values out of the backward pass.
@@ -842,6 +876,14 @@ class PhysicsHead(nn.Module):
         # Scale and offset for interpretability
         # Default scaling aims to put carbon ~6, iron ~26
         Z_eff = self.z_scale * z_raw + self.z_offset
+
+        # The mask has to be applied AFTER the offset, not just to z_raw:
+        # zeroing z_raw alone still leaves every masked pixel reporting
+        # z_offset and still routes a gradient of 1 into z_offset from each
+        # of them, so a large air region could dominate the offset's
+        # training signal. "No denominator" has to mean no value AND no
+        # gradient.
+        Z_eff = torch.where(low_signal, torch.zeros_like(Z_eff), Z_eff)
 
         # Physical non-negativity: Z counts protons. z_scale is positive by
         # construction (softplus), but a learnable z_offset can still be driven
@@ -1477,6 +1519,13 @@ if __name__ == "__main__":
     assert sub_diag_a[0]["n_outliers"] >= 1, (
         "The injected isolated spike was not flagged on the subsampled path"
     )
+    spike_before = A1_sub[0, 0, 10, 10].item()
+    spike_after = A1_sub_a[0, 0, 10, 10].item()
+    assert abs(spike_before - spike_after) > 0.1, (
+        f"Spike survived the subsampled path: A₁ {spike_before:.3f} -> "
+        f"{spike_after:.3f}. Detecting an outlier and then not replacing it "
+        "is the donor-selection failure mode, not a pass."
+    )
     assert torch.equal(A1_sub_a, A1_sub_b) and torch.equal(A2_sub_a, A2_sub_b), (
         "Two identically-seeded filters produced different output: the "
         "subsampling RNG is not deterministic"
@@ -1485,6 +1534,82 @@ if __name__ == "__main__":
         "NaN/Inf in the subsampled filter output"
     )
     print("  ✓ Subsampled path is deterministic and bounded")
+    
+    # -------------------------------------------------------------------------
+    # Test 12: Conditional Self-Match (white-box regression for the k-NN bug)
+    # -------------------------------------------------------------------------
+    print("\n[Test 12] Conditional Self-Match on a Known Reference Cloud")
+    print("  Test 11 exercises the subsampled branch but cannot PIN the bug:")
+    print("  a spike that far from the cloud is flagged either way. This test")
+    print("  fixes the reference cloud and asserts the k-NN statistics")
+    print("  themselves, which differ between the fixed and buggy behaviour.")
+    
+    class _FixedCloudRNG:
+        """
+        Stand-in for np.random.Generator that returns a KNOWN reference
+        cloud, so the expected median/MAD below can be derived by hand
+        instead of depending on which points a real draw happened to pick.
+        """
+        
+        def __init__(self, indices):
+            self._indices = np.asarray(indices)
+        
+        def choice(self, a, size, replace=False):
+            assert a == 8 and size == 4 and replace is False
+            return self._indices
+    
+    # 8 pixels in one 2x4 image, all at the same radius so every A-space
+    # distance is a pure θ distance. Row 1 is an EXACT duplicate of row 0.
+    dup_theta_row = np.array([0.4, 0.6, 0.8, 1.0])
+    dup_theta = np.stack([dup_theta_row, dup_theta_row])   # (2, 4)
+    dup_r = np.full((2, 4), 2.0)
+    
+    A1_dup = torch.from_numpy(dup_r * np.sin(dup_theta)).float().unsqueeze(0).unsqueeze(0)
+    A2_dup = torch.from_numpy(dup_r * np.cos(dup_theta)).float().unsqueeze(0).unsqueeze(0)
+    
+    dup_filter = ASpaceNoiseFilter(
+        theta_min=0.1, theta_max=1.4, k_neighbors=1, subsample_threshold=4
+    )
+    # Reference cloud = row 0 (indices 0..3). Row 1 (indices 4..7) is
+    # therefore queried against a tree it is NOT part of - the exact case
+    # the old code got wrong.
+    dup_filter._rng = _FixedCloudRNG([0, 1, 2, 3])
+    
+    _, _, dup_diag = dup_filter.filter(A1_dup, A2_dup, return_diagnostics=True)
+    
+    # Hand-derived expectation. Normalized spacing between adjacent θ:
+    spacing = 0.2 / (1.4 - 0.1)
+    # In-cloud points (0..3): column 0 is their own 0-distance self-match, so
+    #   their 1st true neighbour is column 1 = spacing.
+    # Out-of-cloud points (4..7): no self-match in the tree, and each is an
+    #   exact duplicate of a cloud point, so column 0 = 0.
+    # -> distances = [s, s, s, s, 0, 0, 0, 0]; median = s/2, MAD = s/2.
+    # Under the PRE-FIX behaviour every point took column 1, giving
+    #   [s, s, s, s, s, s, s, s]: median = s, MAD = 0. Both assertions below
+    #   fail in that case, which is what makes this a regression test.
+    print(f"  Reference cloud: {dup_diag[0]['n_tree_points']} of "
+          f"{dup_diag[0]['n_pixels']} pixels")
+    print(f"  Median k-NN distance: {dup_diag[0]['median_knn_distance']:.6f} "
+          f"(expected {spacing / 2:.6f}, pre-fix {spacing:.6f})")
+    print(f"  MAD: {dup_diag[0]['mad_knn_distance']:.6f} "
+          f"(expected {spacing / 2:.6f}, pre-fix 0.000000)")
+    
+    assert dup_diag[0]["subsampled"] and dup_diag[0]["n_tree_points"] == 4
+    assert abs(dup_diag[0]["median_knn_distance"] - spacing / 2) < 1e-4, (
+        f"Median k-NN distance {dup_diag[0]['median_knn_distance']:.6f} != "
+        f"{spacing / 2:.6f}: out-of-cloud points are not having their "
+        "(non-existent) self-match handled correctly."
+    )
+    assert abs(dup_diag[0]["mad_knn_distance"] - spacing / 2) < 1e-4, (
+        f"MAD {dup_diag[0]['mad_knn_distance']:.6f} != {spacing / 2:.6f}: "
+        "a MAD of 0 here means every point was treated as in-cloud."
+    )
+    assert dup_diag[0]["n_outliers"] == 0, (
+        "An exact duplicate of a reference point is the least isolated "
+        f"pixel possible and must never be flagged; got "
+        f"{dup_diag[0]['n_outliers']} outliers."
+    )
+    print("  ✓ Self-match is discounted only for points in the reference cloud")
     
     # -------------------------------------------------------------------------
     # Final Summary
