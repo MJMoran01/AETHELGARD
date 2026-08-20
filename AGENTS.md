@@ -14,6 +14,14 @@ its directory tree and takes precedence where it conflicts with this file.
   design document (`Aethelgard_Design.md`).
 - **GitHub** owns branches, pull requests, reviews, CI, and mergeability.
 
+**Bootstrap exception (sunsets automatically).** The `AETH` Linear team does
+not exist yet as of this contract's founding commit. Until it is created,
+GitHub Issues on this repo are the interim source of truth for scope and
+status — every PR still needs a linked issue (GitHub, in the interim), just
+not a Linear one. This exception sunsets the moment the `AETH` team exists:
+the next PR opened after that point must link a Linear issue and this
+paragraph should be deleted as part of that PR.
+
 An initiative represents a broad outcome, a project a durable workstream, a
 milestone a project phase, and an issue one actionable deliverable. Do not
 use provider-specific statuses or represent the agent vendor as issue state.
@@ -27,9 +35,14 @@ and defend its architecture.
 
 - **Tier 1 — a machine settles it**: tests, invariants, bit-identity checks,
   negative controls. Cost to the human: a pass/fail line.
-- **Tier 2 — an independent instrument settles it**: a disjoint dataset, a
-  different measurement grain, a reviewer from a *different model provider*
-  than the author. Not a second model reading the same diff.
+- **Tier 2 — an independent instrument settles it.** For code and documents:
+  an adversarial reviewer from a *different model provider* than the author,
+  reading the posted diff (the mandatory PR review below) — this is the
+  instrument for code/process claims. For **empirical claims** (a reported
+  accuracy, a calibration number, any measured result): a disjoint dataset,
+  a different measurement grain, or an independent re-derivation — a second
+  model reading the same result is NOT an independent instrument for an
+  empirical claim, even if it's from a different provider.
 - **Tier 3 — only the human settles it**: architecture, physics modeling
   choices, spend, anything conceptual — by *kind*, not difficulty, however
   confident the agent is.
@@ -140,20 +153,26 @@ Linear issue.
 Every pull request intended for merge must receive an independent,
 substantive, **adversarial** review of the posted diff (the reviewer's
 mandate is to find what is wrong, not to summarize) by someone other than
-the pull-request author — and, when the author is an agent, by a reviewer
-from a **different model provider** — before it may be merged or closed as
-complete. An explicit human-directed abandonment may close a pull request
-without that review; closing an unmerged pull request is not completion
-evidence.
+the pull-request author before it may be merged or closed as complete. Any
+commit carrying an AI co-author trailer (any provider) makes that commit
+**agent-authored** for this rule, regardless of which human GitHub account
+pushed it — the review must then come from a **different model provider**
+than the co-author. An explicit human-directed abandonment may close a pull
+request without that review; closing an unmerged pull request is not
+completion evidence.
 
+- The posted review report must record: the reviewer's identity/model and
+  provider, and the exact head commit SHA it reviewed.
 - Address every actionable review comment within the approved scope.
 - The review report is posted in the PR (as a review or comment).
 - Do not dismiss a review, hide or delete feedback, or otherwise clear a
   review conversation to satisfy this gate. Resolve a conversation only
   after the requested change is implemented and pushed, or after the
   reviewer explicitly agrees that no change is required.
-- After review-driven changes, rerun affected checks and request re-review
-  when appropriate.
+- **Any commit pushed after a review invalidates that review for merge
+  purposes.** Re-review of the new head is required before merge, always —
+  not "when appropriate" — unless the original reviewer explicitly attests
+  in the PR that the new commit needs no further review.
 - If feedback cannot be implemented or is disputed, leave the conversation
   open and record the disagreement, impact, and required human decision.
 
@@ -188,23 +207,51 @@ absolute — a task brief is never authorization to break one.
    ratified decision.
 3. **No credentials in the repo.** Never write a key, token, or `.env` value
    into a tracked file, log, or report.
-4. **Dataset license discipline.** `HUMS-X-ray-Dataset/` is used under its
-   stated "publicly available, academic purpose" terms
-   (`HUMS-X-ray-Dataset/README.md`). Do not redistribute it outside that
-   scope, and do not add other datasets to the repo without checking their
-   license permits redistribution/academic use first.
-5. **The Glass Box policy.** Every operation in `PhysicsHead` (or any
+4. **Dataset license discipline — provenance unverified, treat as an open
+   risk, not a cleared one.** `HUMS-X-ray-Dataset/README.md` says the
+   dataset is "publicly available" and usable "for academic purpose," but
+   names no licensor, source, license identifier, or explicit redistribution
+   grant. That statement authorizes academic *use*; it does not establish
+   that redistributing the raw files through a public GitHub repo is
+   permitted. Do not treat this dataset's presence in the repo as
+   license-cleared. Do not add other datasets without first confirming, in
+   writing, that their license permits both the intended use and repo
+   redistribution — and flag any dataset whose provenance can't be
+   confirmed to Michael rather than assuming it's fine.
+5. **The Glass Box policy — the invariant is Michael's understanding, not
+   just the code's shape.** Every operation in `PhysicsHead` (or any
    physics-preprocessing module) must be justified by a stated physical
-   equation or named approximation. A "black box" shortcut — feeding raw
-   sensor data directly into a CNN without physics preprocessing — is a
-   tier-3 architecture change, not a routine implementation choice: surface
-   it to Michael before writing it, don't silently build around the design
-   document.
-6. **The design document is the current architecture record.**
-   `Aethelgard_Design.md` describes the agreed tensor shapes, module
-   structure, and physics derivations. Treat divergence between code and
-   this document as a bug in one of the two — reconcile them, don't let
-   them silently drift apart.
+   equation or named approximation, and every physical-domain edge case
+   (negative attenuation, near-zero photon counts, division by zero noise)
+   must be enforced in code with an explicit mask or clamp, not just
+   narrated. A "black box" shortcut — feeding raw sensor data directly into
+   a CNN without physics preprocessing — is a tier-3 architecture change:
+   **refuse to write it silently, and surface it to Michael before writing
+   it at all**, per the escalation rule in "Claim tiers" above.
+
+   This does not become optional even if Michael approves a black-box path
+   for some component. The escalation governs whether that architecture
+   gets built; it does not waive what follows: if a black-box (or any
+   otherwise-unexplainable) component ever exists in this repo, an agent
+   must still ensure Michael can explain what it does, why it was chosen
+   over an interpretable alternative, and what its failure modes are, before
+   treating that component as accepted. **Michael is never left holding code
+   he can't defend — that invariant does not get traded away by an
+   architecture decision, only the code's transparency does.** An
+   "academic perfection" rabbit hole (e.g. full iterative reconstruction or
+   exact beam-hardening correction when a stated linear approximation is
+   sufficient and named as such) gets the same redirect, not silent scope
+   creep: name the simpler approximation actually needed and why it's
+   sufficient, rather than either building the elaborate version unasked or
+   skipping the physical justification entirely.
+6. **The design document is the current architecture record — divergence is
+   a stop, not a silent reconcile.** `Aethelgard_Design.md` describes the
+   agreed tensor shapes, module structure, and physics derivations. If code
+   and document disagree, do not resolve it yourself in either direction —
+   not by quietly editing the code to match the doc, and not by editing the
+   doc to match the code. Stop, name the exact divergence, and get Michael's
+   recorded decision on which side was wrong before touching either one.
+   Architecture stays his call even when the "fix" looks obvious.
 
 ## Teaching mandate — build the engineer, not just the code
 
@@ -232,8 +279,12 @@ tiers above:
   should do real work are not.
 - **Periodically check understanding on genuinely complex points** (e.g. why
   a specific exponent or approximation was chosen over an exact method) by
-  asking Michael to state the trade-off back, rather than assuming silent
-  approval means it landed. This is the same discipline as
-  `/leverage:verified-understanding`, applied continuously rather than only
-  at big ratification moments — use that skill directly for architecture-
-  level decisions.
+  asking Michael to state the trade-off back in his own words, rather than
+  assuming silent approval means it landed. Do this directly, in-conversation
+  — it does not depend on any particular harness or plugin. In a Claude Code
+  session with the leverage plugin installed, `/leverage:verified-understanding`
+  is a convenience command for the same discipline at bigger architecture
+  ratification moments; use it there when available, but the underlying
+  behavior (ask him to explain it back, don't just accept a quick "yes")
+  applies in every harness this contract binds, including ones without that
+  plugin.
