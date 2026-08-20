@@ -26,6 +26,7 @@ Author: Michael Moran
 
 import os
 import re
+import warnings
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict, Callable
 
@@ -57,9 +58,32 @@ def load_tif_image(path: str) -> np.ndarray:
         Image as numpy array (H, W), dtype depends on source
     """
     if HAS_TIFFFILE:
-        img = tifffile.imread(path)
+        with tifffile.TiffFile(path) as tif:
+            if len(tif.pages) != 1:
+                raise ValueError(
+                    f"Expected a single-page grayscale TIF image at {path!r}, "
+                    f"but found {len(tif.pages)} pages/frames. Multipage TIFs "
+                    f"are not supported by this dataset loader."
+                )
+            img = tif.pages[0].asarray()
     else:
-        img = np.array(Image.open(path))
+        with Image.open(path) as pil_img:
+            n_frames = getattr(pil_img, "n_frames", 1)
+            if n_frames != 1:
+                raise ValueError(
+                    f"Expected a single-page grayscale TIF image at {path!r}, "
+                    f"but got a multipage TIF with {n_frames} frames. "
+                    f"Multipage TIFs are not supported by this dataset loader."
+                )
+            img = np.array(pil_img)
+
+    if img.ndim != 2:
+        raise ValueError(
+            f"Expected a 2D grayscale TIF image at {path!r}, but got an array "
+            f"with shape {img.shape} (ndim={img.ndim}). Multipage or RGB TIFs "
+            f"are not supported by this dataset loader."
+        )
+
     return img
 
 
@@ -81,15 +105,23 @@ def find_dual_energy_pairs(directory: str) -> List[Tuple[str, str]]:
     hi_files = list(directory.glob("*_hi.tif"))
     
     pairs = []
+    matched_lo_names = set()
     for hi_path in hi_files:
         # Construct matching low energy filename
         lo_path = hi_path.parent / hi_path.name.replace("_hi.tif", "_lo.tif")
         
         if lo_path.exists():
             pairs.append((str(lo_path), str(hi_path)))
+            matched_lo_names.add(lo_path.name)
         else:
             print(f"Warning: No matching low energy file for {hi_path}")
     
+    # Find low energy files with no matching high energy mate
+    lo_files = list(directory.glob("*_lo.tif"))
+    orphan_lo_files = [lo_path for lo_path in lo_files if lo_path.name not in matched_lo_names]
+    for orphan_path in orphan_lo_files:
+        warnings.warn(f"Orphan low energy file with no matching high energy file: {orphan_path}")
+
     # Sort for reproducibility
     pairs.sort(key=lambda x: x[0])
     
@@ -125,7 +157,12 @@ class DualEnergyDataset(Dataset):
             data_dir: Directory containing *_hi.tif and *_lo.tif files
             preprocess: If True, convert raw intensity to log-attenuation.
                        If False, return raw 16-bit intensity values.
-            i0_method: Method for estimating I₀ (see RawToLogAttenuation)
+            i0_method: Method for estimating I₀. This class supports only
+                       'per_image_max' and 'global'; any other value raises
+                       ValueError. (RawToLogAttenuation in preprocessing.py
+                       is a related but separate API that additionally
+                       supports 'per_image_percentile' — not implemented
+                       here.)
             epsilon: Numerical stability constant
             transform: Optional transform to apply to output tensor
             normalize_range: If True, normalize output to [0, 1] range
@@ -157,6 +194,13 @@ class DualEnergyDataset(Dataset):
         img_lo = load_tif_image(lo_path).astype(np.float32)
         img_hi = load_tif_image(hi_path).astype(np.float32)
         
+        if img_lo.shape != img_hi.shape:
+            raise ValueError(
+                f"Mismatched shapes for dual-energy pair: {lo_path!r} has shape "
+                f"{img_lo.shape} but {hi_path!r} has shape {img_hi.shape}. "
+                f"Both images in a pair must have identical dimensions."
+            )
+
         return img_lo, img_hi
     
     def _to_log_attenuation(
@@ -179,9 +223,10 @@ class DualEnergyDataset(Dataset):
             # Use theoretical 16-bit max
             i0_lo = i0_hi = 65535.0
         else:
-            # Fallback to per-image max
-            i0_lo = img_lo.max()
-            i0_hi = img_hi.max()
+            raise ValueError(
+                f"Unknown i0_method: {self.i0_method!r}. Expected one of: "
+                f"'per_image_max', 'global'."
+            )
         
         # Compute transmission
         T_lo = img_lo / (i0_lo + self.epsilon)
@@ -233,10 +278,22 @@ class DualEnergyDataset(Dataset):
         
         # Optional normalization
         if self.normalize_range:
+            if not torch.isfinite(image).all():
+                raise ValueError(
+                    f"normalize_range=True requires a finite tensor, but the "
+                    f"image at index {idx} contains NaN or Inf values "
+                    f"(path_lo={lo_path!r}, path_hi={hi_path!r})."
+                )
             img_min = image.min()
             img_max = image.max()
             if img_max > img_min:
                 image = (image - img_min) / (img_max - img_min)
+            else:
+                # Constant finite tensor: min/max normalization is undefined
+                # (0/0). Map to the midpoint of [0, 1] rather than leaving
+                # the original (unnormalized, physically-unitted) value in
+                # place.
+                image = torch.full_like(image, 0.5)
         
         # Optional transform
         if self.transform is not None:
@@ -304,8 +361,17 @@ class SyntheticDualEnergyDataset(Dataset):
             image_size: (H, W) size of generated images
             seed: Random seed for reproducibility
         """
+        H, W = image_size
+        if H <= 50 or W <= 50:
+            raise ValueError(
+                f"image_size={image_size!r} is too small: both dimensions must be "
+                f"greater than 50px because synthetic objects are placed with a "
+                f"hardcoded up-to-50px offset/extent."
+            )
+
         self.num_samples = num_samples
         self.image_size = image_size
+        self.seed = seed
         self.rng = np.random.RandomState(seed)
         
         # Define some "materials" with (mu_low, mu_high) attenuation coefficients
@@ -358,8 +424,12 @@ class SyntheticDualEnergyDataset(Dataset):
     
     def __getitem__(self, idx: int) -> Dict:
         """Get a synthetic sample (already in log-attenuation space)."""
-        # Set seed for this index to ensure reproducibility
-        self.rng = np.random.RandomState(42 + idx)
+        # Derive a per-index RNG from this instance's seed to ensure
+        # reproducibility while still respecting the constructor's `seed` arg.
+        # RandomState requires a seed in [0, 2**32 - 1]; wrap instead of
+        # overflowing when self.seed is near the top of that range.
+        per_item_seed = (self.seed + idx) % (2**32)
+        self.rng = np.random.RandomState(per_item_seed)
         
         L_lo, L_hi, label = self._generate_sample()
         
@@ -419,6 +489,7 @@ if __name__ == "__main__":
                 
         except Exception as e:
             print(f"  Error loading HUMS dataset: {e}")
+            raise
     else:
         print(f"  HUMS dataset not found at {hums_path}")
         print("  Skipping real data test")

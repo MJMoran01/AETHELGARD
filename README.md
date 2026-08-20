@@ -111,8 +111,7 @@ import torch
 # Load dual-energy images
 dataset = DualEnergyDataset(
     data_dir="HUMS-X-ray-Dataset/HighLow",
-    preprocess=True,
-    gaussian_sigma=1.0
+    preprocess=True
 )
 
 # Get a sample
