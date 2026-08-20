@@ -60,7 +60,15 @@ def load_tif_image(path: str) -> np.ndarray:
     if HAS_TIFFFILE:
         img = tifffile.imread(path)
     else:
-        img = np.array(Image.open(path))
+        with Image.open(path) as pil_img:
+            n_frames = getattr(pil_img, "n_frames", 1)
+            if n_frames != 1:
+                raise ValueError(
+                    f"Expected a single-page grayscale TIF image at {path!r}, "
+                    f"but got a multipage TIF with {n_frames} frames. "
+                    f"Multipage TIFs are not supported by this dataset loader."
+                )
+            img = np.array(pil_img)
 
     if img.ndim != 2:
         raise ValueError(
@@ -142,7 +150,12 @@ class DualEnergyDataset(Dataset):
             data_dir: Directory containing *_hi.tif and *_lo.tif files
             preprocess: If True, convert raw intensity to log-attenuation.
                        If False, return raw 16-bit intensity values.
-            i0_method: Method for estimating I₀ (see RawToLogAttenuation)
+            i0_method: Method for estimating I₀. This class supports only
+                       'per_image_max' and 'global'; any other value raises
+                       ValueError. (RawToLogAttenuation in preprocessing.py
+                       is a related but separate API that additionally
+                       supports 'per_image_percentile' — not implemented
+                       here.)
             epsilon: Numerical stability constant
             transform: Optional transform to apply to output tensor
             normalize_range: If True, normalize output to [0, 1] range
@@ -258,14 +271,21 @@ class DualEnergyDataset(Dataset):
         
         # Optional normalization
         if self.normalize_range:
+            if not torch.isfinite(image).all():
+                raise ValueError(
+                    f"normalize_range=True requires a finite tensor, but the "
+                    f"image at index {idx} contains NaN or Inf values "
+                    f"(path_lo={lo_path!r}, path_hi={hi_path!r})."
+                )
             img_min = image.min()
             img_max = image.max()
             if img_max > img_min:
                 image = (image - img_min) / (img_max - img_min)
             else:
-                # Constant tensor: min/max normalization is undefined (0/0).
-                # Map to the midpoint of [0, 1] rather than leaving the
-                # original (unnormalized, physically-unitted) value in place.
+                # Constant finite tensor: min/max normalization is undefined
+                # (0/0). Map to the midpoint of [0, 1] rather than leaving
+                # the original (unnormalized, physically-unitted) value in
+                # place.
                 image = torch.full_like(image, 0.5)
         
         # Optional transform
@@ -399,7 +419,10 @@ class SyntheticDualEnergyDataset(Dataset):
         """Get a synthetic sample (already in log-attenuation space)."""
         # Derive a per-index RNG from this instance's seed to ensure
         # reproducibility while still respecting the constructor's `seed` arg.
-        self.rng = np.random.RandomState(self.seed + idx)
+        # RandomState requires a seed in [0, 2**32 - 1]; wrap instead of
+        # overflowing when self.seed is near the top of that range.
+        per_item_seed = (self.seed + idx) % (2**32)
+        self.rng = np.random.RandomState(per_item_seed)
         
         L_lo, L_hi, label = self._generate_sample()
         
