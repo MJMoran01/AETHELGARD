@@ -675,16 +675,28 @@ class PhysicsHead(nn.Module):
         # Individually representable is not enough: Z_eff = z_scale * z_raw +
         # z_offset, so at the reference point z_raw = 1 (A1 == A2, an entirely
         # ordinary pixel) the SUM has to be representable too - two separately
-        # legal float32 maxima overflow to inf together. This bounds the
-        # CONFIGURATION, which is what a constructor can bound. It does not
-        # bound the data: a large enough A1/A2 overflows any finite scale, and
-        # that is an input problem this module has no more defense against
-        # than it does against an A1 of 1e30.
+        # legal float32 maxima overflow to inf together.
+        #
+        # This is a conservative SUFFICIENT bound, deliberately not a tight
+        # one: |a| + |b| <= FLOAT32_MAX guarantees a*z_raw + b is
+        # representable at z_raw = 1 for every sign combination, while some
+        # rejected pairs (a huge scale against an equally huge NEGATIVE
+        # offset) would in fact have cancelled to something finite. Rejecting
+        # those is the intended trade: a configuration that only stays finite
+        # by catastrophic cancellation is not one this module should accept
+        # silently.
+        #
+        # It bounds the CONFIGURATION, which is what a constructor can bound.
+        # It does not bound the data: a large enough A1/A2 overflows any
+        # finite scale, and that is an input problem this module has no more
+        # defense against than it does against an A1 of 1e30.
         if z_scale + abs(z_offset) > _FLOAT32_MAX:
             raise ValueError(
-                f"z_scale ({z_scale}) + |z_offset| ({abs(z_offset)}) overflows "
-                f"float32 (limit {_FLOAT32_MAX:g}); Z_eff would be inf for any "
-                "pixel with A1 >= A2"
+                f"z_scale ({z_scale}) + |z_offset| ({abs(z_offset)}) exceeds the "
+                f"float32 limit {_FLOAT32_MAX:g}. This is a conservative bound: "
+                "it guarantees Z_eff = z_scale * z_raw + z_offset stays "
+                "representable at z_raw = 1 for either sign of the offset, and "
+                "rejects pairs that would only remain finite by cancellation"
             )
         z_scale_raw = _inverse_softplus(torch.tensor(float(z_scale)))
         z_offset_tensor = torch.tensor(float(z_offset))
