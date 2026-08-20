@@ -495,6 +495,39 @@ class ASpaceNoiseFilter:
         )
 
 
+# The module stores its scalars as float32 tensors, so "finite in Python"
+# is not the property that matters: 1e39 is a perfectly finite Python float
+# that becomes inf on conversion, and 1e-50 becomes exactly zero. Validate
+# against the representable float32 range instead.
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
+_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+
+
+def _check_float32_scalar(name: str, value: float, positive: bool = True) -> float:
+    """
+    Reject a configuration scalar that cannot survive the trip to float32.
+
+    NaN is checked with math.isfinite rather than a bare comparison because
+    NaN fails every ordering test: `if value <= 0` waves NaN straight
+    through, and a NaN threshold or scale silently poisons every downstream
+    map instead of raising here.
+    """
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value}")
+    if positive and value <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    if abs(value) > _FLOAT32_MAX:
+        raise ValueError(
+            f"{name}={value} overflows float32 (limit {_FLOAT32_MAX:g})"
+        )
+    if value != 0.0 and abs(value) < _FLOAT32_TINY:
+        raise ValueError(
+            f"{name}={value} underflows to zero in float32 "
+            f"(smallest normal {_FLOAT32_TINY:g})"
+        )
+    return value
+
+
 def _inverse_softplus(y: torch.Tensor) -> torch.Tensor:
     """
     Inverse of softplus, for storing a strictly-positive parameter
@@ -554,10 +587,14 @@ class PhysicsHead(nn.Module):
                 as z_cbrt_grad_max^(-3/2) rather than being a second free
                 constant (see _compute_z_effective). The default of 100
                 puts that floor at 1e-3, i.e. the linear segment covers
-                exactly the region below z_raw = 0.1 -> Z_eff = 1 at the
-                default z_scale: below hydrogen, the lowest element that
-                exists, so the guard can only ever reshape a region that
-                is already physically empty. Nothing is calibrated here.
+                exactly the region below z_raw = 0.1, which is Z_eff = 1 at
+                the module's DEFAULT z_scale: below hydrogen, the lowest
+                element that exists, so at that scale the guard can only
+                reshape a region that is already physically empty. That
+                anchor is only as meaningful as the default scale it refers
+                to, which is itself uncalibrated (issue #3) - hence this is
+                an argued default, not a derived physical constant, and it
+                is a constructor argument so recalibration can move it.
                 The low-signal mask that goes with it introduces no new
                 constant at all: it reuses `epsilon` (below).
             epsilon: Small constant for numerical stability (prevents division by zero)
@@ -566,21 +603,18 @@ class PhysicsHead(nn.Module):
         
         self.order = order
         self.epsilon = epsilon
-        # Scalar validation uses math.isfinite, not a bare comparison: NaN
-        # fails every ordering test, so `if x <= 0` waves NaN straight
-        # through and a NaN threshold or floor would silently poison every
-        # downstream map instead of raising here.
-        if not math.isfinite(epsilon) or epsilon <= 0.0:
-            raise ValueError(f"epsilon must be finite and positive, got {epsilon}")
-        if not math.isfinite(z_cbrt_grad_max) or z_cbrt_grad_max <= 0.0:
-            raise ValueError(
-                f"z_cbrt_grad_max must be finite and positive, got {z_cbrt_grad_max}"
-            )
+        _check_float32_scalar("epsilon", epsilon)
+        _check_float32_scalar("z_cbrt_grad_max", z_cbrt_grad_max)
         self.z_cbrt_grad_max = z_cbrt_grad_max
         # Derived, not chosen: the linear segment through the origin and
         # (floor, floor^(1/3)) has slope floor^(-2/3); setting that equal to
-        # z_cbrt_grad_max gives floor = z_cbrt_grad_max^(-3/2).
-        self.z_ratio_floor = z_cbrt_grad_max ** -1.5
+        # z_cbrt_grad_max gives floor = z_cbrt_grad_max^(-3/2). Validated in
+        # turn, because a huge (but finite) z_cbrt_grad_max underflows the
+        # floor to zero, and 0 ** (-2/3) raises rather than clamping.
+        self.z_ratio_floor = _check_float32_scalar(
+            "z_ratio_floor (derived from z_cbrt_grad_max)",
+            z_cbrt_grad_max ** -1.5,
+        )
         
         # Number of polynomial terms: (n+1)(n+2)/2 for 2D polynomial of order n
         # Order 2: 1 + 2 + 3 = 6 terms
@@ -622,13 +656,10 @@ class PhysicsHead(nn.Module):
         # tracked in issue #3; the default is unchanged here (preserved to
         # float32 round-trip precision through inverse-softplus/softplus).
         # =====================================================================
-        if not math.isfinite(z_scale) or z_scale <= 0.0:
-            raise ValueError(
-                "z_scale must be finite and positive (Z_eff is non-negative), "
-                f"got {z_scale}"
-            )
-        if not math.isfinite(z_offset):
-            raise ValueError(f"z_offset must be finite, got {z_offset}")
+        # Positive because Z_eff is non-negative; float32-checked because the
+        # value is about to become a float32 tensor.
+        _check_float32_scalar("z_scale", z_scale)
+        _check_float32_scalar("z_offset", z_offset, positive=False)
         z_scale_raw = _inverse_softplus(torch.tensor(float(z_scale)))
         z_offset_tensor = torch.tensor(float(z_offset))
         
@@ -843,11 +874,21 @@ class PhysicsHead(nn.Module):
         #   (a) a low-signal MASK: where A2 is at or below the module's own
         #       stability epsilon the denominator is numerically zero, so
         #       the WHOLE output (offset included) is forced to 0 with no
-        #       gradient. Note what this deliberately does NOT claim: it is
-        #       a numerical-degeneracy test, not a physical air/material
-        #       discrimination, so it introduces no new constant and makes
-        #       no assertion about how the coefficients are scaled. It uses
-        #       exactly the epsilon the old denominator already used.
+        #       gradient.
+        #
+        #       Be precise about what this threshold is and is not. It is a
+        #       numerical-degeneracy test, NOT a physical air/material
+        #       discrimination - a pixel is masked because its denominator
+        #       is unusable, not because it was identified as air. Any
+        #       absolute threshold on A2 is still relative to whatever scale
+        #       the (uncalibrated, learnable) coefficients put A2 on, and
+        #       this one is no exception. It reuses exactly the epsilon the
+        #       previous `A1 / (A2 + epsilon)` denominator already applied
+        #       at this same point, so the scale dependence is INHERITED and
+        #       now explicit, not newly introduced. Replacing it with a
+        #       physically anchored threshold requires calibrating the
+        #       coefficients first - a tier-3 question tracked in issue #3,
+        #       and out of scope for the code-safety fix in issue #7.
         #   (b) a gradient CLAMP on the cube root: below z_ratio_floor the cube
         #       root is replaced by the straight line through the origin and
         #       (floor, floor^(1/3)) - identical value at the join, but a
@@ -1577,16 +1618,26 @@ if __name__ == "__main__":
     
     _, _, dup_diag = dup_filter.filter(A1_dup, A2_dup, return_diagnostics=True)
     
-    # Hand-derived expectation. Normalized spacing between adjacent θ:
+    # Hand-derived expectation, APPROXIMATE by construction: the A-maps are
+    # float32, `_cartesian_to_polar` adds epsilon before arctan2, and r is
+    # reconstructed as sqrt(A1²+A2²), so both the 0.2 spacing and the shared
+    # radius are recovered only to ~1e-6. What IS exact is the part the test
+    # turns on: row 1 is computed from bit-identical float32 inputs to row 0,
+    # so each duplicate pair is at distance exactly 0. The 1e-4 tolerance
+    # below is ~100x the round-trip error and ~700x smaller than the s/2 vs s
+    # gap it has to resolve.
+    # Normalized spacing between adjacent θ:
     spacing = 0.2 / (1.4 - 0.1)
     # In-cloud points (0..3): column 0 is their own 0-distance self-match, so
     #   their 1st true neighbour is column 1 = spacing.
     # Out-of-cloud points (4..7): no self-match in the tree, and each is an
     #   exact duplicate of a cloud point, so column 0 = 0.
-    # -> distances = [s, s, s, s, 0, 0, 0, 0]; median = s/2, MAD = s/2.
+    # -> distances ≈ [s, s, s, s, 0, 0, 0, 0]; median ≈ s/2, MAD ≈ s/2.
     # Under the PRE-FIX behaviour every point took column 1, giving
-    #   [s, s, s, s, s, s, s, s]: median = s, MAD = 0. Both assertions below
-    #   fail in that case, which is what makes this a regression test.
+    #   ≈[s]*8: median ≈ s, MAD ≈ 0 (not exactly 0, but ~1e-6). Both
+    #   assertions below fail in that case by ~s/2 = 0.077, four orders of
+    #   magnitude outside the tolerance - which is what makes this a
+    #   regression test rather than a smoke test.
     print(f"  Reference cloud: {dup_diag[0]['n_tree_points']} of "
           f"{dup_diag[0]['n_pixels']} pixels")
     print(f"  Median k-NN distance: {dup_diag[0]['median_knn_distance']:.6f} "
