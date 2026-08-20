@@ -114,7 +114,7 @@ def find_dual_energy_pairs(directory: str) -> List[Tuple[str, str]]:
     orphan_lo_files = [lo_path for lo_path in lo_files if lo_path.name not in matched_lo_names]
     for orphan_path in orphan_lo_files:
         warnings.warn(f"Orphan low energy file with no matching high energy file: {orphan_path}")
-    
+
     # Sort for reproducibility
     pairs.sort(key=lambda x: x[0])
     
@@ -193,7 +193,7 @@ class DualEnergyDataset(Dataset):
                 f"{img_lo.shape} but {hi_path!r} has shape {img_hi.shape}. "
                 f"Both images in a pair must have identical dimensions."
             )
-        
+
         return img_lo, img_hi
     
     def _to_log_attenuation(
@@ -361,7 +361,7 @@ class SyntheticDualEnergyDataset(Dataset):
                 f"greater than 50px because synthetic objects are placed with a "
                 f"hardcoded up-to-50px offset/extent."
             )
-        
+
         self.num_samples = num_samples
         self.image_size = image_size
         self.seed = seed
