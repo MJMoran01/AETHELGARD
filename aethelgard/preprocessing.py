@@ -58,6 +58,8 @@ Author: Michael Moran
 """
 
 import math
+import operator
+from fractions import Fraction
 
 import torch
 import torch.nn as nn
@@ -86,6 +88,8 @@ def create_gaussian_kernel(sigma: float, kernel_size: int = None) -> torch.Tenso
             auto-computed from sigma.
 
     Raises:
+        TypeError: if kernel_size is not an integer (a non-integral size
+            silently changes the kernel's extent).
         ValueError: if sigma is non-finite or <= 0 (the Gaussian is undefined
             and 1/(2*sigma**2) divides by zero), or if kernel_size is < 1 or
             even. An even kernel
@@ -107,6 +111,17 @@ def create_gaussian_kernel(sigma: float, kernel_size: int = None) -> torch.Tenso
         if kernel_size % 2 == 0:
             kernel_size += 1  # Ensure odd size
     else:
+        # operator.index rejects floats (and NaN/inf) outright. A non-integral
+        # size would otherwise pass both checks below and silently change the
+        # kernel's extent: torch.arange(3.5) has FOUR elements, i.e. an even
+        # kernel, which then breaks size preservation. The auto-computed
+        # branch above already yields an int, so this check belongs here only.
+        try:
+            kernel_size = operator.index(kernel_size)
+        except TypeError as exc:
+            raise TypeError(
+                f"kernel_size must be an integer, got {kernel_size!r}."
+            ) from exc
         if kernel_size < 1:
             raise ValueError(f"kernel_size must be >= 1, got {kernel_size}")
         if kernel_size % 2 == 0:
@@ -227,6 +242,21 @@ class RawToLogAttenuation(nn.Module):
             raise ValueError(
                 f"i0_percentile must be in (0, 100], got {i0_percentile}."
             )
+        # Validate the value that will actually be STORED, not only the Python
+        # float that was passed. The buffer is float32, where 1e-46 rounds to
+        # 0.0 (restoring the division by zero this parameter exists to prevent)
+        # and 0.99999999 rounds to 1.0 (collapsing the clamp to [1, 1] and
+        # erasing all attenuation). numpy_to_log_attenuation needs no
+        # equivalent read-back: it keeps the caller's float64 value unchanged.
+        epsilon_buffer = torch.tensor(epsilon, dtype=torch.float32)
+        epsilon_stored = float(epsilon_buffer)
+        if not (0 < epsilon_stored < 1.0):
+            raise ValueError(
+                f"epsilon={epsilon} is stored as {epsilon_stored} in float32, "
+                "which is outside (0, 1). Choose a value that survives the "
+                "float32 round trip."
+            )
+
         valid_padding_modes = ("reflect", "replicate", "constant")
         if blur_padding_mode not in valid_padding_modes:
             raise ValueError(
@@ -235,7 +265,7 @@ class RawToLogAttenuation(nn.Module):
             )
         
         # Store as buffers (not parameters - these don't get gradients)
-        self.register_buffer("epsilon", torch.tensor(epsilon))
+        self.register_buffer("epsilon", epsilon_buffer)
         self.register_buffer("global_i0", torch.tensor(2**max_bit_depth - 1, dtype=torch.float32))
         
         self.gaussian_sigma = gaussian_sigma
@@ -335,7 +365,15 @@ class RawToLogAttenuation(nn.Module):
             # Nearest-rank convention: rank = ceil(p/100 * N), so p=50 over
             # N=5 gives rank 3 (the median) rather than the rank-2 value that
             # truncation would return.
-            k = math.ceil((self.i0_percentile / 100.0) * (H * W))
+            #
+            # The percentile is interpreted as the DECIMAL the caller wrote,
+            # via Fraction(str(...)), not as its binary float image: in binary
+            # floating point (99.9 / 100) * 10000 is 9990.000000000002, whose
+            # ceil is 9991 - one rank too high. Fraction(99.9) does not help
+            # either, since the exact binary value of the literal is likewise
+            # above 99.9; only the decimal string gives 999/10 and hence
+            # exactly 9990.
+            k = math.ceil(Fraction(str(float(self.i0_percentile))) * (H * W) / 100)
             # Clamp to the valid 1-indexed rank range [1, N]; the upper clamp
             # also absorbs a possible +1 overshoot from float rounding in the
             # ceil above.
