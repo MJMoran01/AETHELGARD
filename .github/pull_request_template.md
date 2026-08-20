@@ -5,9 +5,9 @@
      an answer. -->
 
 ## Issue
-<!-- Linear AETH-123, or GitHub issue #N, or — only under the documented
-     bootstrap exception — "no issue: bootstrap exception, AGENTS.md
-     'Sources of truth'". -->
+<!-- Linear AETH-123, or — under the bootstrap exception while team AETH
+     doesn't exist yet — GitHub issue #N. Every PR links one; the bootstrap
+     exception changes which tracker, not whether an issue is required. -->
 
 ## Goal
 <!-- One sentence, in terms of the observable end state. -->

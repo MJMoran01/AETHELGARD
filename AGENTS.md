@@ -16,11 +16,14 @@ its directory tree and takes precedence where it conflicts with this file.
 
 **Bootstrap exception (sunsets automatically).** The `AETH` Linear team does
 not exist yet as of this contract's founding commit. Until it is created,
-GitHub Issues on this repo are the interim source of truth for scope and
-status — every PR still needs a linked issue (GitHub, in the interim), just
-not a Linear one. This exception sunsets the moment the `AETH` team exists:
-the next PR opened after that point must link a Linear issue and this
-paragraph should be deleted as part of that PR.
+every place below that says "Linear issue" means "GitHub Issue on this
+repo" instead — start-of-run checks, progress updates, and PR linkage all
+route to GitHub Issues, with no substantive difference in what's required
+(an issue must exist and be linked; only the tracker changes). No PR gets a
+free pass on having a linked issue at all — that requirement is not part of
+what this exception waives. This exception sunsets the moment the `AETH`
+team exists: the next PR opened after that point links a Linear issue and
+this paragraph is deleted as part of that PR.
 
 An initiative represents a broad outcome, a project a durable workstream, a
 milestone a project phase, and an issue one actionable deliverable. Do not
@@ -81,16 +84,19 @@ Use this lifecycle unless the issue documents an exception:
   blocker and next unblocking action.
 - Use `Canceled` or `Duplicate` only with an explicit human disposition.
 
-Update Linear directly as work progresses; repository edits do not update it.
+Update the issue (Linear, or GitHub under the bootstrap exception) directly
+as work progresses; repository edits do not update it.
 
 ## Start-of-run checks
 
 Before changing files:
 
-1. Read the complete Linear issue, project plan, milestone, dependencies,
-   linked source material, and every applicable `AGENTS.md`.
-2. Confirm that the request matches the issue. Report discrepancies in
-   Linear before proceeding.
+1. Read the complete Linear issue (or GitHub Issue, under the bootstrap
+   exception above), project plan, milestone, dependencies, linked source
+   material, and every applicable `AGENTS.md`.
+2. Confirm that the request matches the issue. Report discrepancies on the
+   issue (Linear, or GitHub under the bootstrap exception) before
+   proceeding.
 3. Run `git status --short --branch` and `git worktree list`.
 4. Confirm that the path and branch are dedicated to the active issue and
    contain no unrelated changes.
@@ -112,7 +118,8 @@ investigation may use an existing checkout.
 - Create the worktree from the intended target branch. Do not base new work
   on unrelated uncommitted or unpublished changes.
 - Include the primary issue identifier in the branch name, for example
-  `agent/aeth-12-short-description`.
+  `agent/aeth-12-short-description` (Linear) or `agent/gh-12-short-description`
+  (GitHub, under the bootstrap exception).
 - If a write-capable task starts in the wrong checkout, create or switch to
   a dedicated worktree before editing.
 - **Treat all pre-existing changes as user-owned. Never move, discard,
@@ -127,13 +134,15 @@ If safe isolation cannot be established, stop and report the exact conflict.
 ## Pull request execution
 
 Every non-trivial change requires a pull request linked to its primary
-Linear issue.
+issue (Linear, or GitHub under the bootstrap exception above) — every PR,
+with no exception for "this is just process setup."
 
 - Prefer one pull request per actionable issue. Combined or stacked pull
   requests require a documented reason and dependency order.
 - Include the issue identifier in the branch name or PR title and add
-  `Refs AETH-12` to the description. Use a closing keyword only when
-  automatic closure is deliberately requested.
+  `Refs AETH-12` (Linear) or `Refs #12` (GitHub, under the bootstrap
+  exception) to the description. Use a closing keyword only when automatic
+  closure is deliberately requested.
 - The PR body follows `.github/pull_request_template.md` (the brief: goal,
   files, constraints honored, verification, report).
 - Open a draft PR when the implementation is coherent enough to review. An
@@ -170,9 +179,12 @@ completion evidence.
   after the requested change is implemented and pushed, or after the
   reviewer explicitly agrees that no change is required.
 - **Any commit pushed after a review invalidates that review for merge
-  purposes.** Re-review of the new head is required before merge, always —
-  not "when appropriate" — unless the original reviewer explicitly attests
-  in the PR that the new commit needs no further review.
+  purposes, unconditionally.** Re-review of the new head is required before
+  merge, every time — there is no attestation, "trivial change," or "the
+  same reviewer already looked at this" exception. A "no further review
+  needed" claim from anyone, including the original reviewer, does not
+  substitute for actually reviewing the new diff and posting new
+  identity/provider + head-SHA evidence for it.
 - If feedback cannot be implemented or is disputed, leave the conversation
   open and record the disagreement, impact, and required human decision.
 
