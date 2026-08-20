@@ -7,28 +7,37 @@ its directory tree and takes precedence where it conflicts with this file.
 
 ## Sources of truth
 
-- **Linear** (team `AETH`) owns active plans, milestones, scope, priority,
-  dependencies, ownership, status, and acceptance. The Linear
-  `PLAN — Aethelgard` document is the canonical living project plan.
+- **The active tracker** owns active plans, milestones, scope, priority,
+  dependencies, ownership, status, and acceptance. This is Linear (team
+  `AETH`), with the canonical living plan being the Linear
+  `PLAN — Aethelgard` document — **except during the bootstrap window
+  below, when it is GitHub Issues on this repo instead, with a plan
+  document living as a pinned GitHub Issue.** Every rule anywhere in this
+  contract that references "Linear," "the Linear issue," "the Linear
+  plan," or an "AETH-123" identifier means "the active tracker" as
+  currently defined by this section — there is no operational rule in this
+  contract that is Linear-only. Wherever this file gives a Linear-flavored
+  example (an `AETH-12` identifier, a `Refs AETH-12` line), the
+  GitHub-flavored equivalent (issue `#12`, `Refs #12`) applies identically
+  during the bootstrap window.
 - **The repository** owns architecture, implementation, tests, and the
   design document (`Aethelgard_Design.md`).
 - **GitHub** owns branches, pull requests, reviews, CI, and mergeability.
 
-**Bootstrap exception (sunsets automatically).** The `AETH` Linear team does
-not exist yet as of this contract's founding commit. Until it is created,
-every place below that says "Linear issue" means "GitHub Issue on this
-repo" instead — start-of-run checks, progress updates, and PR linkage all
-route to GitHub Issues, with no substantive difference in what's required
-(an issue must exist and be linked; only the tracker changes). No PR gets a
-free pass on having a linked issue at all — that requirement is not part of
-what this exception waives. This exception sunsets the moment the `AETH`
-team exists: the next PR opened after that point links a Linear issue and
-this paragraph is deleted as part of that PR.
+**Bootstrap window (sunsets automatically).** The `AETH` Linear team does
+not exist yet as of this contract's founding commit, so "the active
+tracker" above resolves to GitHub Issues. No PR gets a free pass on having
+a linked issue, a linked plan, or a recorded worktree/branch — the
+bootstrap window changes which system holds that record, never whether the
+record is required. This window sunsets the moment the `AETH` team exists:
+the next PR opened after that point links a Linear issue instead, and this
+paragraph is deleted as part of that PR.
 
 An initiative represents a broad outcome, a project a durable workstream, a
 milestone a project phase, and an issue one actionable deliverable. Do not
 use provider-specific statuses or represent the agent vendor as issue state.
-The human Linear assignee (Michael) remains accountable.
+The human tracker assignee (Michael) remains accountable regardless of
+which tracker is active.
 
 ## Claim tiers and record gates
 
@@ -84,19 +93,16 @@ Use this lifecycle unless the issue documents an exception:
   blocker and next unblocking action.
 - Use `Canceled` or `Duplicate` only with an explicit human disposition.
 
-Update the issue (Linear, or GitHub under the bootstrap exception) directly
-as work progresses; repository edits do not update it.
+Update the active tracker's issue directly as work progresses; repository edits do not update it.
 
 ## Start-of-run checks
 
 Before changing files:
 
-1. Read the complete Linear issue (or GitHub Issue, under the bootstrap
-   exception above), project plan, milestone, dependencies, linked source
-   material, and every applicable `AGENTS.md`.
+1. Read the complete active-tracker issue, project plan, milestone,
+   dependencies, linked source material, and every applicable `AGENTS.md`.
 2. Confirm that the request matches the issue. Report discrepancies on the
-   issue (Linear, or GitHub under the bootstrap exception) before
-   proceeding.
+   active-tracker issue before proceeding.
 3. Run `git status --short --branch` and `git worktree list`.
 4. Confirm that the path and branch are dedicated to the active issue and
    contain no unrelated changes.
@@ -113,19 +119,20 @@ Do not implement in the primary checkout, a shared workspace, another task's
 worktree, or a worktree containing unrelated changes. Read-only
 investigation may use an existing checkout.
 
-- Use one issue per worktree and branch unless Linear explicitly defines a
-  combined deliverable.
+- Use one issue per worktree and branch unless the active tracker
+  explicitly defines a combined deliverable.
 - Create the worktree from the intended target branch. Do not base new work
   on unrelated uncommitted or unpublished changes.
 - Include the primary issue identifier in the branch name, for example
   `agent/aeth-12-short-description` (Linear) or `agent/gh-12-short-description`
-  (GitHub, under the bootstrap exception).
+  (GitHub, during the bootstrap window).
 - If a write-capable task starts in the wrong checkout, create or switch to
   a dedicated worktree before editing.
 - **Treat all pre-existing changes as user-owned. Never move, discard,
   overwrite, stage, commit, or incorporate them into the task.** If they
   block you, stop and report.
-- Record the branch and worktree path in Linear when implementation begins.
+- Record the branch and worktree path on the active-tracker issue when
+  implementation begins.
 - Remove only a clean worktree created for the current task, and only after
   its work is merged or explicitly abandoned. Never perform broad cleanup.
 
@@ -134,14 +141,14 @@ If safe isolation cannot be established, stop and report the exact conflict.
 ## Pull request execution
 
 Every non-trivial change requires a pull request linked to its primary
-issue (Linear, or GitHub under the bootstrap exception above) — every PR,
+issue on the active tracker — every PR,
 with no exception for "this is just process setup."
 
 - Prefer one pull request per actionable issue. Combined or stacked pull
   requests require a documented reason and dependency order.
 - Include the issue identifier in the branch name or PR title and add
-  `Refs AETH-12` (Linear) or `Refs #12` (GitHub, under the bootstrap
-  exception) to the description. Use a closing keyword only when automatic
+  `Refs AETH-12` (Linear) or `Refs #12` (GitHub, during the bootstrap
+  window) to the description. Use a closing keyword only when automatic
   closure is deliberately requested.
 - The PR body follows `.github/pull_request_template.md` (the brief: goal,
   files, constraints honored, verification, report).
@@ -191,11 +198,13 @@ completion evidence.
 ## Plans, handoff, and human gates
 
 When scope, sequencing, milestones, decisions, or exit criteria change,
-update the canonical Linear project plan and affected issue or milestone.
+update the canonical active-tracker project plan and affected issue or
+milestone.
 Update repository Markdown (`Aethelgard_Design.md`) separately only when
 technical design or durable evidence changes.
 
-Before handoff, add a concise Linear update containing: what changed and
+Before handoff, add a concise update on the active-tracker issue
+containing: what changed and
 what intentionally did not; affected files; commands and results, including
 failures and retries; branch, commit, PR, and evidence links; remaining
 risks, follow-up issues, or blockers.
