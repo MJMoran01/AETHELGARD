@@ -130,13 +130,31 @@ def visualize_log_attenuation(
 ):
     """
     Visualize log-attenuation images after preprocessing.
+
+    Runs the REAL preprocessing module (RawToLogAttenuation) rather than
+    the dataset's separate NumPy conversion path, so this validates the
+    actual pipeline (including Gaussian denoising) that feeds PhysicsHead
+    in production.
     """
     print(f"\n[2] Visualizing log-attenuation (sample {idx})...")
-    
-    # Get preprocessed sample
-    sample = dataset[idx]
-    L_tensor = sample['image']  # (2, H, W)
-    
+
+    # Get raw (unprocessed) images and run them through the real
+    # preprocessing module, matching how the production pipeline (and
+    # demo_debug.py) constructs log-attenuation from raw intensity.
+    img_lo, img_hi = dataset.get_raw_pair(idx)
+    raw_tensor = torch.from_numpy(
+        np.stack([img_lo, img_hi], axis=0)
+    ).unsqueeze(0).float()  # (1, 2, H, W)
+
+    preprocessor = RawToLogAttenuation(
+        epsilon=dataset.epsilon,
+        gaussian_sigma=1.0,
+        i0_method=dataset.i0_method,
+    )
+    with torch.no_grad():
+        L_batch = preprocessor(raw_tensor)  # (1, 2, H, W)
+    L_tensor = L_batch.squeeze(0)  # (2, H, W)
+
     L_low = L_tensor[0].numpy()
     L_high = L_tensor[1].numpy()
     
@@ -455,7 +473,7 @@ def run_validation():
     if not data_dir.exists():
         print(f"\n✗ ERROR: HUMS dataset not found at {data_dir}")
         print("  Please ensure the dataset is in the correct location.")
-        return
+        raise FileNotFoundError(f"HUMS dataset not found at {data_dir}")
     
     # Load dataset
     print(f"\nLoading dataset from: {data_dir}")
@@ -467,7 +485,7 @@ def run_validation():
         )
     except Exception as e:
         print(f"✗ ERROR loading dataset: {e}")
-        return
+        raise
     
     # Print dataset stats
     print(f"\nDataset Statistics:")
