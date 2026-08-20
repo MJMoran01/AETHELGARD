@@ -25,7 +25,6 @@ Supervisor: Dr. Thomas Anthony, CTO, Analytical AI
 """
 
 import sys
-import os
 from pathlib import Path
 
 # Add parent directory to path for imports
@@ -35,10 +34,9 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from matplotlib.colors import Normalize
 
 # Import our modules
-from aethelgard.dataset import DualEnergyDataset, load_tif_image
+from aethelgard.dataset import DualEnergyDataset
 from aethelgard.physics_head import PhysicsHead
 from aethelgard.preprocessing import RawToLogAttenuation
 

@@ -62,7 +62,7 @@ Supervisor: Dr. Thomas Anthony, CTO, Analytical AI
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import Tuple
 import numpy as np
 from scipy.spatial import cKDTree
 
