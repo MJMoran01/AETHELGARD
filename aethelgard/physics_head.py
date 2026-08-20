@@ -114,7 +114,8 @@ class ASpaceNoiseFilter:
         k_neighbors: int = 1,
         mad_multiplier: float = 3.0,
         subsample_threshold: int = 100000,
-        epsilon: float = 1e-6
+        epsilon: float = 1e-6,
+        seed: Optional[int] = 0
     ):
         """
         Initialize the A-Space Noise Filter.
@@ -134,6 +135,13 @@ class ASpaceNoiseFilter:
             subsample_threshold: If image has more pixels than this, subsample
                                 for k-NN computation (performance optimization).
             epsilon: Small constant for numerical stability.
+            seed: Seed for the RNG used to subsample the k-NN reference
+                  cloud when an image exceeds subsample_threshold pixels.
+                  Defaults to 0 so a filter run is reproducible by default;
+                  pass None to draw from OS entropy instead. The Generator
+                  is created once per filter instance, so it is the
+                  SEQUENCE of filter() calls from construction that is
+                  reproducible, not any single call in isolation.
         """
         self.theta_min = theta_min
         self.theta_max = theta_max
@@ -141,6 +149,12 @@ class ASpaceNoiseFilter:
         self.mad_multiplier = mad_multiplier
         self.subsample_threshold = subsample_threshold
         self.epsilon = epsilon
+        self.seed = seed
+        # Determinism is a correctness property here, not a convenience: an
+        # unseeded subsample changes the median/MAD outlier threshold, so the
+        # same input image produced different filtered A-maps on different
+        # runs. Own the Generator rather than touching global numpy state.
+        self._rng = np.random.default_rng(seed)
     
     def _cartesian_to_polar(
         self,
@@ -248,11 +262,15 @@ class ASpaceNoiseFilter:
         
         ALGORITHM:
         ----------
-        1. Build a KD-tree of all (θ, r) points
-        2. For each point, find distance to k-th nearest neighbor
+        1. Build a KD-tree over a reference cloud of (θ, r) points (all of
+           them, or a bounded random subsample for very large images)
+        2. For each point, find distance to its k-th nearest neighbor in
+           that reference cloud, discounting a self-match if (and only if)
+           the point is itself part of the reference cloud
         3. Compute median and MAD of these distances
         4. Flag points where distance > median + mad_multiplier * MAD
-        5. Replace flagged points with nearest valid neighbor's values
+        5. Replace flagged points with the values of their nearest
+           non-outlier point in that same reference cloud
         
         Args:
             theta: Array of angles (flattened)
@@ -265,71 +283,101 @@ class ASpaceNoiseFilter:
             stats: Dictionary with diagnostic statistics
         """
         n_pixels = len(theta)
-        
-        # Normalize θ and r to similar scales for distance computation
+
+        # Normalize theta and r to similar scales for distance computation
         # This prevents one dimension from dominating the distance metric
         theta_range = self.theta_max - self.theta_min
         r_max = np.percentile(r, 99) + self.epsilon  # Robust max
-        
+
         theta_normalized = (theta - self.theta_min) / theta_range
         r_normalized = r / r_max
-        
+
         # Stack into 2D points for k-NN
         points = np.column_stack([theta_normalized, r_normalized])
-        
-        # Build KD-tree for efficient nearest neighbor search
-        # For very large images, we may need to subsample
+
+        theta_filtered = theta.copy()
+        r_filtered = r.copy()
+
+        # Build KD-tree for efficient nearest neighbor search.
+        # For very large images we subsample the TREE, not the query set: every
+        # pixel is still tested, but against a bounded reference cloud.
         if n_pixels > self.subsample_threshold:
-            # Subsample for tree building, but query all points
-            subsample_idx = np.random.choice(
+            tree_idx = self._rng.choice(
                 n_pixels, self.subsample_threshold, replace=False
             )
-            tree = cKDTree(points[subsample_idx])
         else:
-            tree = cKDTree(points)
-        
-        # Query k+1 neighbors (first neighbor is the point itself)
-        # Returns (distances, indices) for k+1 nearest neighbors
+            tree_idx = np.arange(n_pixels)
+        n_tree = len(tree_idx)
+
+        # Degenerate case, made explicit per the Glass Box policy: with fewer
+        # reference points than neighbours requested there is no meaningful
+        # "distance to my k-th neighbour" and cKDTree returns inf, which would
+        # poison the median/MAD threshold. An A-space cloud that small carries
+        # no outlier information, so pass the data through untouched.
+        if n_pixels < 2 or n_tree < self.k_neighbors + 1:
+            stats = {
+                "n_pixels": n_pixels,
+                "n_outliers": 0,
+                "outlier_fraction": 0.0,
+                "median_knn_distance": 0.0,
+                "mad_knn_distance": 0.0,
+                "threshold": 0.0,
+                "max_knn_distance": 0.0,
+                "n_tree_points": n_tree,
+                "subsampled": bool(n_tree < n_pixels),
+                "degenerate": True,
+            }
+            return theta_filtered, r_filtered, stats
+
+        tree = cKDTree(points[tree_idx])
+
+        # Query k+1 neighbours, then discount the self-match CONDITIONALLY.
+        # A point that is in the reference cloud matches itself at distance 0,
+        # so its k-th true neighbour is in column k. A point that is NOT in the
+        # cloud has no self-match, so its k-th true neighbour is in column k-1.
+        # Taking column k for everyone (the previous behaviour) skipped a real
+        # neighbour for every out-of-cloud pixel, inflating its distance and
+        # contaminating the median/MAD threshold on exactly the large images
+        # that trigger subsampling.
+        in_tree = np.zeros(n_pixels, dtype=bool)
+        in_tree[tree_idx] = True
+
         distances, _ = tree.query(points, k=self.k_neighbors + 1)
-        
-        # Get distance to k-th nearest neighbor (excluding self)
-        # If k=1, this is distance to closest other point
-        knn_distances = distances[:, -1]  # Last column is k-th neighbor
-        
+        knn_distances = np.where(
+            in_tree,
+            distances[:, self.k_neighbors],
+            distances[:, self.k_neighbors - 1],
+        )
+
         # Compute robust statistics
         median_dist = np.median(knn_distances)
         mad = np.median(np.abs(knn_distances - median_dist))
-        
+
         # Threshold: points with distance > median + multiplier * MAD are outliers
         # Add epsilon to MAD to handle degenerate cases (all same distance)
         threshold = median_dist + self.mad_multiplier * (mad + self.epsilon)
-        
+
         outlier_mask = knn_distances > threshold
-        n_outliers = np.sum(outlier_mask)
-        
-        # For outliers, replace with nearest valid neighbor's values
-        theta_filtered = theta.copy()
-        r_filtered = r.copy()
-        
+        n_outliers = int(np.sum(outlier_mask))
+
         if n_outliers > 0:
-            # Get indices of valid (non-outlier) points
-            valid_mask = ~outlier_mask
-            valid_points = points[valid_mask]
-            valid_theta = theta[valid_mask]
-            valid_r = r[valid_mask]
-            
-            if len(valid_points) > 0:
-                # Build tree of valid points only
-                valid_tree = cKDTree(valid_points)
-                
-                # For each outlier, find nearest valid point
-                outlier_points = points[outlier_mask]
-                _, nearest_valid_idx = valid_tree.query(outlier_points, k=1)
-                
-                # Replace outlier values with nearest valid neighbor
-                theta_filtered[outlier_mask] = valid_theta[nearest_valid_idx]
-                r_filtered[outlier_mask] = valid_r[nearest_valid_idx]
-        
+            # Replacement donors come from the SAME (possibly subsampled)
+            # reference cloud used for detection. Rebuilding a tree over every
+            # valid pixel would undo the memory/time bound precisely on the
+            # images that have outliers. When no subsampling occurred tree_idx
+            # is every pixel, so this is identical to the previous behaviour.
+            donor_idx = tree_idx[~outlier_mask[tree_idx]]
+
+            if len(donor_idx) > 0:
+                donor_tree = cKDTree(points[donor_idx])
+
+                # For each outlier, find its nearest surviving donor
+                _, nearest_donor = donor_tree.query(points[outlier_mask], k=1)
+
+                # Replace outlier values with that donor's values
+                theta_filtered[outlier_mask] = theta[donor_idx][nearest_donor]
+                r_filtered[outlier_mask] = r[donor_idx][nearest_donor]
+
         # Compile statistics for diagnostics
         stats = {
             "n_pixels": n_pixels,
@@ -339,8 +387,11 @@ class ASpaceNoiseFilter:
             "mad_knn_distance": mad,
             "threshold": threshold,
             "max_knn_distance": np.max(knn_distances),
+            "n_tree_points": n_tree,
+            "subsampled": bool(n_tree < n_pixels),
+            "degenerate": False,
         }
-        
+
         return theta_filtered, r_filtered, stats
     
     def filter(
@@ -423,6 +474,18 @@ class ASpaceNoiseFilter:
         )
 
 
+def _inverse_softplus(y: torch.Tensor) -> torch.Tensor:
+    """
+    Inverse of softplus, for storing a strictly-positive parameter
+    in unconstrained form.
+
+    softplus(x) = log(1 + exp(x)); its algebraic inverse log(exp(y) - 1)
+    overflows for moderate y, so we use the stable equivalent
+    y + log(-expm1(-y)), valid for y > 0.
+    """
+    return y + torch.log(-torch.expm1(-y))
+
+
 class PhysicsHead(nn.Module):
     """
     Differentiable Physics Layer for Alvarez-Macovski Decomposition.
@@ -450,6 +513,8 @@ class PhysicsHead(nn.Module):
         learnable: bool = True,
         z_scale: float = 10.0,
         z_offset: float = 0.0,
+        z_signal_threshold: float = 1e-3,
+        z_ratio_floor: float = 1e-2,
         epsilon: float = 1e-6
     ):
         """
@@ -462,12 +527,33 @@ class PhysicsHead(nn.Module):
                       If False, coefficients are buffers (frozen).
             z_scale: Scaling factor for Z_eff output (helps with interpretability)
             z_offset: Offset for Z_eff output
+            z_signal_threshold: Low-signal mask threshold on A2 (Compton).
+                A2 is proportional to electron density, so A2 at or below
+                this level is air/noise rather than material, and the
+                ratio A1/A2 that Z_eff is built from carries no
+                information there. Those pixels report z_offset and
+                contribute no gradient. This is a numerical-validity
+                guard, NOT a calibrated physical threshold.
+            z_ratio_floor: Ratio below which the cube root d(r^(1/3))/dr
+                is replaced by a bounded linear segment (see
+                _compute_z_effective). Also a numerical guard, not a
+                calibration constant.
             epsilon: Small constant for numerical stability (prevents division by zero)
         """
         super().__init__()
         
         self.order = order
         self.epsilon = epsilon
+        if z_signal_threshold <= 0.0:
+            raise ValueError(
+                f"z_signal_threshold must be positive, got {z_signal_threshold}"
+            )
+        if z_ratio_floor <= 0.0:
+            raise ValueError(
+                f"z_ratio_floor must be positive, got {z_ratio_floor}"
+            )
+        self.z_signal_threshold = z_signal_threshold
+        self.z_ratio_floor = z_ratio_floor
         
         # Number of polynomial terms: (n+1)(n+2)/2 for 2D polynomial of order n
         # Order 2: 1 + 2 + 3 = 6 terms
@@ -494,13 +580,45 @@ class PhysicsHead(nn.Module):
             self.register_buffer("coeffs_a1", coeffs_a1)
             self.register_buffer("coeffs_a2", coeffs_a2)
         
-        # Z_eff scaling parameters (also learnable)
+        # =====================================================================
+        # Z_eff SCALING PARAMETERS
+        # z_scale converts a dimensionless basis ratio into a reported
+        # "effective atomic number". Z counts protons, so the map has to be
+        # non-negative - but an unconstrained learnable scale lets an
+        # optimizer walk it through zero and report negative atomic numbers,
+        # violating the module's own physical interpretation. We therefore
+        # store a RAW parameter and expose z_scale = softplus(raw), which is
+        # strictly positive for every real value the optimizer can reach.
+        #
+        # This constrains the learnable parameter's RANGE only. Whether 10.0
+        # is the physically correct value is a tier-3 calibration question
+        # tracked in issue #3; the default is unchanged here (preserved to
+        # float32 round-trip precision through inverse-softplus/softplus).
+        # =====================================================================
+        if z_scale <= 0.0:
+            raise ValueError(
+                f"z_scale must be positive (Z_eff is non-negative), got {z_scale}"
+            )
+        z_scale_raw = _inverse_softplus(torch.tensor(float(z_scale)))
+        z_offset_tensor = torch.tensor(float(z_offset))
+        
         if learnable:
-            self.z_scale = nn.Parameter(torch.tensor(z_scale))
-            self.z_offset = nn.Parameter(torch.tensor(z_offset))
+            self.z_scale_raw = nn.Parameter(z_scale_raw)
+            self.z_offset = nn.Parameter(z_offset_tensor)
         else:
-            self.register_buffer("z_scale", torch.tensor(z_scale))
-            self.register_buffer("z_offset", torch.tensor(z_offset))
+            self.register_buffer("z_scale_raw", z_scale_raw)
+            self.register_buffer("z_offset", z_offset_tensor)
+    
+    @property
+    def z_scale(self) -> torch.Tensor:
+        """
+        Z_eff scale, positive by construction: softplus(z_scale_raw).
+        
+        Read-only on purpose - the constraint lives in the parameterization,
+        so there is no way for training (or a caller) to set a negative
+        scale. Construct the module with a different `z_scale=` to change it.
+        """
+        return F.softplus(self.z_scale_raw)
     
     def _init_heuristic_coefficients(
         self,
@@ -676,21 +794,60 @@ class PhysicsHead(nn.Module):
             A2: Compton coefficient (B, 1, H, W)
             
         Returns:
-            Z_eff: Effective atomic number (B, 1, H, W), scaled for interpretability
+            Z_eff: Effective atomic number (B, 1, H, W), scaled for
+                   interpretability, and zero wherever the Compton signal
+                   A2 is below z_signal_threshold (no material, no Z).
         """
-        # Compute ratio with epsilon to prevent division by zero
-        # In air regions, A2 ≈ 0, so we need numerical protection
-        ratio = A1 / (A2 + self.epsilon)
-        
-        # Cube root to invert the Z³ scaling
-        # torch.pow handles negative inputs by returning NaN, but we've
-        # already ensured A1, A2 >= 0 via ReLU
-        z_raw = torch.pow(ratio + self.epsilon, 1.0 / 3.0)
-        
+        # -----------------------------------------------------------------
+        # THE TRAP: Z_eff is a RATIO feature, and a ratio means nothing where
+        # there is no signal. In air, A2 (Compton, proportional to electron
+        # density) is ~0, so A1/A2 is 0/0 noise. The previous code added an
+        # epsilon to the denominator AND a second epsilon inside the cube root,
+        # which bounds the value but not the noise: A1=0 with A2>0 reported
+        # Z_eff = z_scale * eps^(1/3) = 0.1 rather than 0, and the cube root's
+        # derivative near zero, (1/3)*eps^(-2/3) ~ 3.3e3 before scaling, turned
+        # basis noise into enormous gradients. A1>0 with A2 -> 0 ran the other
+        # way and reported an unboundedly large atomic number.
+        #
+        # THE FIX (AGENTS.md Glass Box - an explicit mask/clamp, not prose):
+        #   (a) a low-signal MASK on A2: at or below z_signal_threshold there
+        #       is no Compton signal to divide by, so Z_eff is reported as the
+        #       offset and contributes no gradient. This also removes the
+        #       unbounded-Z branch, since a large ratio now requires a real A2.
+        #   (b) a gradient CLAMP on the cube root: below z_ratio_floor the cube
+        #       root is replaced by the straight line through the origin and
+        #       (floor, floor^(1/3)) - identical value at the join, but a
+        #       bounded slope floor^(-2/3) instead of a divergent one.
+        # -----------------------------------------------------------------
+        low_signal = A2 <= self.z_signal_threshold
+
+        # Divide by a safe denominator. The mask discards these entries anyway;
+        # this keeps their (meaningless, huge) values out of the backward pass.
+        A2_safe = torch.where(low_signal, torch.ones_like(A2), A2)
+        ratio = A1 / A2_safe
+
+        # Cube root to invert the Z^3 scaling. A1, A2 >= 0 via ReLU and
+        # A2_safe > 0, so the ratio is non-negative and pow() is well defined.
+        floor = self.z_ratio_floor
+        # clamp() contributes zero gradient below the floor and torch.where
+        # routes the gradient through the linear branch there, so neither
+        # branch can emit the infinite derivative of d/dr r^(1/3) at r = 0.
+        z_cube_root = torch.pow(ratio.clamp(min=floor), 1.0 / 3.0)
+        z_linear = ratio * (floor ** (1.0 / 3.0 - 1.0))
+        z_raw = torch.where(ratio < floor, z_linear, z_cube_root)
+
+        # Low-signal pixels carry no Z information: value AND gradient zeroed.
+        z_raw = torch.where(low_signal, torch.zeros_like(z_raw), z_raw)
+
         # Scale and offset for interpretability
         # Default scaling aims to put carbon ~6, iron ~26
         Z_eff = self.z_scale * z_raw + self.z_offset
-        
+
+        # Physical non-negativity: Z counts protons. z_scale is positive by
+        # construction (softplus), but a learnable z_offset can still be driven
+        # negative, so the reported map is clamped at zero.
+        Z_eff = Z_eff.clamp(min=0.0)
+
         return Z_eff
     
     def _compute_ratio_gradient(
@@ -779,6 +936,31 @@ class PhysicsHead(nn.Module):
                 - 'grad_R': Ratio gradient
                 - 'ratio_map': The R = L_low/L_high map (thickness-invariant)
         """
+        # ---------------------------------------------------------------------
+        # TENSOR CONTRACT - enforced, not assumed. Slicing x[:, 0:1] / x[:, 1:2]
+        # meant a (B, 3, H, W) input silently lost its third channel, and a
+        # wrong-rank tensor failed somewhere deep in the polynomial stack. The
+        # spatial minimum is a physical requirement, not a style choice: the
+        # ratio gradient is a finite difference along each axis, so a 1-pixel
+        # axis yields an empty difference map that F.pad(mode='replicate')
+        # cannot pad.
+        # ---------------------------------------------------------------------
+        if x.dim() != 4:
+            raise ValueError(
+                "PhysicsHead expects a 4-D tensor (B, 2, H, W), got shape "
+                f"{tuple(x.shape)}"
+            )
+        if x.shape[1] != 2:
+            raise ValueError(
+                "PhysicsHead expects exactly 2 input channels [L_low, L_high], "
+                f"got {x.shape[1]} in shape {tuple(x.shape)}"
+            )
+        if x.shape[2] < 2 or x.shape[3] < 2:
+            raise ValueError(
+                "PhysicsHead requires H >= 2 and W >= 2 (the ratio gradient is a "
+                f"finite difference along both axes), got shape {tuple(x.shape)}"
+            )
+        
         # Split input channels
         L_low = x[:, 0:1, :, :]   # (B, 1, H, W)
         L_high = x[:, 1:2, :, :]  # (B, 1, H, W)
@@ -831,10 +1013,14 @@ class PhysicsHead(nn.Module):
                 else:
                     term_names.append(f"L^{i}*H^{j}")
         
+        # .numpy() SHARES storage with a CPU tensor, so the arrays returned
+        # here used to be live views of the model's parameters: writing to
+        # summary["coeffs_a1"] mutated the model while bypassing autograd.
+        # .copy() makes this a snapshot, which is all a summary should be.
         return {
             "term_names": term_names,
-            "coeffs_a1": self.coeffs_a1.detach().cpu().numpy(),
-            "coeffs_a2": self.coeffs_a2.detach().cpu().numpy(),
+            "coeffs_a1": self.coeffs_a1.detach().cpu().numpy().copy(),
+            "coeffs_a2": self.coeffs_a2.detach().cpu().numpy().copy(),
             "z_scale": self.z_scale.item() if isinstance(self.z_scale, torch.Tensor) else self.z_scale,
             "z_offset": self.z_offset.item() if isinstance(self.z_offset, torch.Tensor) else self.z_offset,
         }
@@ -847,6 +1033,12 @@ if __name__ == "__main__":
     print("=" * 70)
     print("PhysicsHead Unit Test")
     print("=" * 70)
+    
+    # The semantic checks below are hard assertions on RNG-drawn data, so
+    # the seeds are part of the test contract: without them a passing run
+    # is not evidence that the next run passes.
+    np.random.seed(0)
+    torch.manual_seed(0)
     
     # -------------------------------------------------------------------------
     # Test 1: Shape Verification
@@ -904,10 +1096,12 @@ if __name__ == "__main__":
     print(f"  Ratio (salt/sugar): {z_salt/z_sugar:.2f}")
     
     # Salt should have higher Z_eff than sugar
-    if z_salt > z_sugar:
-        print("  ✓ Salt has higher Z_eff than sugar (physically correct!)")
-    else:
-        print("  ✗ WARNING: Salt should have higher Z_eff than sugar!")
+    assert z_salt > z_sugar, (
+        f"Salt Z_eff ({z_salt:.4f}) must exceed sugar Z_eff ({z_sugar:.4f}): "
+        "the photoelectric term scales as Z^3, so the higher-Z material has "
+        "to report the higher effective atomic number."
+    )
+    print("  ✓ Salt has higher Z_eff than sugar (physically correct!)")
     
     # -------------------------------------------------------------------------
     # Test 3: Gradient Check for Material Boundary
@@ -940,11 +1134,13 @@ if __name__ == "__main__":
     print(f"  Interior gradient (x=16): {interior_grad:.4f}")
     print(f"  Boundary gradient (x=31): {boundary_grad:.4f}")
     
-    if boundary_grad > 0.1 and boundary_grad > interior_grad * 5:
-        print("  ✓ Boundary has significantly higher gradient (edge detection works!)")
-    else:
-        print(f"  ✗ WARNING: Boundary gradient should be much higher than interior")
-        print(f"      Expected boundary_grad > 0.1, got {boundary_grad:.4f}")
+    assert boundary_grad > 0.1 and boundary_grad > interior_grad * 5, (
+        f"Compositional edge not detected: boundary gradient {boundary_grad:.4f} "
+        f"vs interior {interior_grad:.4f}. R is thickness-invariant, so a "
+        "material change must show up in grad(R) and a homogeneous interior "
+        "must not."
+    )
+    print("  ✓ Boundary has significantly higher gradient (edge detection works!)")
     
     # -------------------------------------------------------------------------
     # Test 4: Non-negativity Constraint
@@ -958,10 +1154,11 @@ if __name__ == "__main__":
     A1 = random_output[:, 0]
     A2 = random_output[:, 1]
     
-    if (A1 >= 0).all() and (A2 >= 0).all():
-        print("  ✓ All A₁, A₂ values are non-negative (physically valid)")
-    else:
-        print("  ✗ WARNING: Negative attenuation coefficients detected!")
+    assert (A1 >= 0).all() and (A2 >= 0).all(), (
+        "Negative attenuation coefficients: mass attenuation cannot be "
+        "negative, so the ReLU feasibility constraint has been violated."
+    )
+    print("  ✓ All A₁, A₂ values are non-negative (physically valid)")
     
     # -------------------------------------------------------------------------
     # Test 5: Numerical Stability
@@ -976,10 +1173,10 @@ if __name__ == "__main__":
     print(f"  NaN present: {has_nan}")
     print(f"  Inf present: {has_inf}")
     
-    if not has_nan and not has_inf:
-        print("  ✓ No NaN or Inf in output")
-    else:
-        print("  ✗ WARNING: Numerical instability detected!")
+    assert not has_nan and not has_inf, (
+        f"Numerical instability in PhysicsHead output (NaN={has_nan}, Inf={has_inf})"
+    )
+    print("  ✓ No NaN or Inf in output")
     
     # -------------------------------------------------------------------------
     # Summary
@@ -1067,10 +1264,12 @@ if __name__ == "__main__":
     print(f"  θ range after filter: [{min_theta_after:.3f}, {max_theta_after:.3f}]")
     print(f"  Valid θ range: [{noise_filter.theta_min:.3f}, {noise_filter.theta_max:.3f}]")
     
-    if min_theta_after >= noise_filter.theta_min - 0.01:  # Small tolerance
-        print("  ✓ All impossible θ values were clamped (wedge clamp works!)")
-    else:
-        print(f"  ✗ WARNING: Some θ values still below θ_min!")
+    assert min_theta_after >= noise_filter.theta_min - 0.01, (  # Small tolerance
+        f"θ = {min_theta_after:.4f} survived the wedge clamp but is below "
+        f"θ_min = {noise_filter.theta_min:.4f}: that is a physically "
+        "impossible effective atomic number leaving the filter."
+    )
+    print("  ✓ All impossible θ values were clamped (wedge clamp works!)")
     
     # -------------------------------------------------------------------------
     # Test 7: k-NN Outlier Detection - Isolated Noise Spike
@@ -1125,12 +1324,14 @@ if __name__ == "__main__":
     
     spike_changed = abs(original_spike_a1 - filtered_spike_a1) > 0.1
     
-    if spike_changed:
-        print(f"  ✓ Isolated spike was detected and corrected!")
-        print(f"    Original A₁ at spike: {original_spike_a1:.3f}")
-        print(f"    Filtered A₁ at spike: {filtered_spike_a1:.3f}")
-    else:
-        print(f"  ✗ WARNING: Spike was not detected as outlier")
+    assert spike_changed, (
+        f"Isolated spike not corrected: A₁ went {original_spike_a1:.3f} -> "
+        f"{filtered_spike_a1:.3f}. A pixel with no A-space neighbours is the "
+        "filter's definition of noise; if it survives, pass 2 does nothing."
+    )
+    print(f"  ✓ Isolated spike was detected and corrected!")
+    print(f"    Original A₁ at spike: {original_spike_a1:.3f}")
+    print(f"    Filtered A₁ at spike: {filtered_spike_a1:.3f}")
     
     # -------------------------------------------------------------------------
     # Test 8: Legitimate Small Object Should NOT Be Filtered
@@ -1183,10 +1384,12 @@ if __name__ == "__main__":
     print(f"  Filtered rivet A₁: {filtered_rivet_a1:.3f}")
     print(f"  Outliers detected: {rivet_diagnostics[0]['n_outliers']}")
     
-    if rivet_preserved:
-        print("  ✓ Metal rivet cluster was preserved (not falsely flagged as noise)")
-    else:
-        print("  ✗ WARNING: Rivet was incorrectly filtered out!")
+    assert rivet_preserved, (
+        f"Metal rivet was filtered out: A₁ went {original_rivet_a1:.3f} -> "
+        f"{filtered_rivet_a1:.3f}. A 3x3 cluster of high-Z pixels is a real "
+        "object with A-space neighbours, not an isolated noise spike."
+    )
+    print("  ✓ Metal rivet cluster was preserved (not falsely flagged as noise)")
     
     # -------------------------------------------------------------------------
     # Test 9: Filter Shape Preservation
@@ -1202,10 +1405,10 @@ if __name__ == "__main__":
     print(f"  Input shape: A1={A1_test.shape}, A2={A2_test.shape}")
     print(f"  Output shape: A1={A1_out.shape}, A2={A2_out.shape}")
     
-    if A1_out.shape == A1_test.shape and A2_out.shape == A2_test.shape:
-        print("  ✓ Output shapes match input shapes")
-    else:
-        print("  ✗ WARNING: Shape mismatch!")
+    assert A1_out.shape == A1_test.shape and A2_out.shape == A2_test.shape, (
+        f"Filter changed shape: {A1_test.shape} -> {A1_out.shape}"
+    )
+    print("  ✓ Output shapes match input shapes")
     
     # -------------------------------------------------------------------------
     # Test 10: Numerical Stability After Filtering
@@ -1220,10 +1423,68 @@ if __name__ == "__main__":
     print(f"  Inf present: {has_inf}")
     print(f"  Negative values: {has_negative}")
     
-    if not has_nan and not has_inf:
-        print("  ✓ No NaN or Inf in filtered output")
-    else:
-        print("  ✗ WARNING: Numerical instability detected!")
+    assert not has_nan and not has_inf, (
+        f"Numerical instability after filtering (NaN={has_nan}, Inf={has_inf})"
+    )
+    print("  ✓ No NaN or Inf in filtered output")
+    
+    # -------------------------------------------------------------------------
+    # Test 11: Subsampled k-NN Path (determinism + out-of-cloud self-match)
+    # -------------------------------------------------------------------------
+    print("\n[Test 11] Subsampled k-NN Path")
+    print("  Every test above sits below the 100k subsample threshold, so the")
+    print("  subsampled branch (bounded reference cloud, conditional self-match,")
+    print("  donor reuse) would otherwise never execute. Force it with a small")
+    print("  threshold on a 64x64 image.")
+    
+    H, W = 64, 64  # 4096 pixels, well above the 500 forced below
+    sub_rng = np.random.default_rng(1234)
+    theta_sub = 0.5 + sub_rng.standard_normal((H, W)) * 0.01
+    r_sub = 2.0 + sub_rng.standard_normal((H, W)) * 0.005
+    
+    # One isolated spike, deliberately placed so it is very unlikely to be
+    # drawn into the 500-point reference cloud: it exercises the
+    # out-of-cloud query path where the self-match column must NOT be skipped.
+    theta_sub[10, 10] = 1.25
+    r_sub[10, 10] = 4.5
+    
+    A1_sub = torch.from_numpy(r_sub * np.sin(theta_sub)).float().unsqueeze(0).unsqueeze(0)
+    A2_sub = torch.from_numpy(r_sub * np.cos(theta_sub)).float().unsqueeze(0).unsqueeze(0)
+    
+    sub_filter_a = ASpaceNoiseFilter(
+        theta_min=0.1, theta_max=1.4, subsample_threshold=500, seed=0
+    )
+    sub_filter_b = ASpaceNoiseFilter(
+        theta_min=0.1, theta_max=1.4, subsample_threshold=500, seed=0
+    )
+    
+    A1_sub_a, A2_sub_a, sub_diag_a = sub_filter_a.filter(
+        A1_sub, A2_sub, return_diagnostics=True
+    )
+    A1_sub_b, A2_sub_b, _ = sub_filter_b.filter(
+        A1_sub, A2_sub, return_diagnostics=True
+    )
+    
+    print(f"  Reference cloud: {sub_diag_a[0]['n_tree_points']} of "
+          f"{sub_diag_a[0]['n_pixels']} pixels")
+    print(f"  Subsampled branch taken: {sub_diag_a[0]['subsampled']}")
+    print(f"  Outliers detected: {sub_diag_a[0]['n_outliers']}")
+    
+    assert sub_diag_a[0]["subsampled"], "Test 11 did not exercise the subsampled branch"
+    assert sub_diag_a[0]["n_tree_points"] == 500, (
+        f"Reference cloud should be capped at 500, got {sub_diag_a[0]['n_tree_points']}"
+    )
+    assert sub_diag_a[0]["n_outliers"] >= 1, (
+        "The injected isolated spike was not flagged on the subsampled path"
+    )
+    assert torch.equal(A1_sub_a, A1_sub_b) and torch.equal(A2_sub_a, A2_sub_b), (
+        "Two identically-seeded filters produced different output: the "
+        "subsampling RNG is not deterministic"
+    )
+    assert not torch.isnan(A1_sub_a).any() and not torch.isinf(A1_sub_a).any(), (
+        "NaN/Inf in the subsampled filter output"
+    )
+    print("  ✓ Subsampled path is deterministic and bounded")
     
     # -------------------------------------------------------------------------
     # Final Summary
