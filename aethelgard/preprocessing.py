@@ -57,6 +57,8 @@ We clamp the transmission ratio T = I/I_0 to the range [epsilon, 1.0]:
 Author: Michael Moran
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -84,18 +86,19 @@ def create_gaussian_kernel(sigma: float, kernel_size: int = None) -> torch.Tenso
             auto-computed from sigma.
 
     Raises:
-        ValueError: if sigma <= 0 (the Gaussian is undefined and 1/(2*sigma**2)
-            divides by zero), or if kernel_size is < 1 or even. An even kernel
+        ValueError: if sigma is non-finite or <= 0 (the Gaussian is undefined
+            and 1/(2*sigma**2) divides by zero), or if kernel_size is < 1 or
+            even. An even kernel
             has no centre tap, and padding it by kernel_size // 2 would change
             the convolution's output size instead of preserving it.
         
     Returns:
         Gaussian kernel tensor of shape (1, 1, kernel_size, kernel_size)
     """
-    if sigma <= 0:
+    if not math.isfinite(sigma) or sigma <= 0:
         raise ValueError(
-            f"sigma must be > 0 to define a Gaussian kernel, got {sigma}. "
-            "To disable blurring, do not build a kernel at all."
+            f"sigma must be finite and > 0 to define a Gaussian kernel, got "
+            f"{sigma}. To disable blurring, do not build a kernel at all."
         )
 
     if kernel_size is None:
@@ -174,7 +177,8 @@ class RawToLogAttenuation(nn.Module):
                      HVLs = log2(1 / 1e-6) = log2(1e6) = 19.93.
                      (-ln(1e-6) = 13.8 is the natural-log attenuation depth,
                      NOT an HVL count; the two differ by the factor ln(2).)
-                     Must be in (0, 1].
+                     Must be in (0, 1): epsilon == 1 would clamp every
+                     pixel to transmission 1 and erase all attenuation.
             gaussian_sigma: Standard deviation for pre-log Gaussian blur.
                            Set to 0 to disable blur. Default 1.0 pixels.
                            Physics justification: Averages out Poisson shot
@@ -193,7 +197,8 @@ class RawToLogAttenuation(nn.Module):
                            retained only as an explicit opt-in.
 
         Raises:
-            ValueError: for epsilon outside (0, 1], negative gaussian_sigma,
+            ValueError: for epsilon outside (0, 1), a non-finite or negative
+                gaussian_sigma,
                 i0_percentile outside (0, 100], or an unknown
                 blur_padding_mode.
         """
@@ -202,17 +207,21 @@ class RawToLogAttenuation(nn.Module):
         # Input validation. These parameters exist to PROVIDE numerical
         # protection, so a value that silently disables that protection is a
         # configuration error, not a configuration. (Refs #5, findings 3-4.)
-        if not (0 < epsilon <= 1.0):
+        if not (0 < epsilon < 1.0):
             raise ValueError(
-                f"epsilon must be in (0, 1], got {epsilon}. epsilon <= 0 leaves "
-                "0/0 -> NaN for an all-black image and admits log of a "
-                "non-positive number; epsilon > 1 makes the clamp bounds "
-                "[epsilon, 1.0] invalid (min > max)."
+                f"epsilon must be in (0, 1), got {epsilon}. epsilon <= 0 (or "
+                "NaN) leaves 0/0 -> NaN for an all-black image and admits log "
+                "of a non-positive number; epsilon == 1 collapses the clamp to "
+                "[1, 1], erasing all attenuation; epsilon > 1 makes the clamp "
+                "bounds [epsilon, 1.0] invalid (min > max)."
             )
-        if gaussian_sigma < 0:
+        # math.isfinite is required as well as the sign test: NaN compares
+        # False against both < 0 and > 0, so an unchecked NaN would slip
+        # through here and then silently DISABLE the blur below.
+        if not math.isfinite(gaussian_sigma) or gaussian_sigma < 0:
             raise ValueError(
-                f"gaussian_sigma must be >= 0, got {gaussian_sigma} "
-                "(exactly 0 disables the blur)."
+                f"gaussian_sigma must be finite and >= 0, got "
+                f"{gaussian_sigma} (exactly 0 disables the blur)."
             )
         if not (0 < i0_percentile <= 100):
             raise ValueError(
@@ -323,8 +332,14 @@ class RawToLogAttenuation(nn.Module):
             x_flat = x.view(B, C, -1)  # (B, C, H*W)
             
             # Compute percentile along spatial dimension
-            k = int((self.i0_percentile / 100.0) * (H * W))
-            k = max(1, min(k, H * W))  # Clamp to the valid 1-indexed rank range
+            # Nearest-rank convention: rank = ceil(p/100 * N), so p=50 over
+            # N=5 gives rank 3 (the median) rather than the rank-2 value that
+            # truncation would return.
+            k = math.ceil((self.i0_percentile / 100.0) * (H * W))
+            # Clamp to the valid 1-indexed rank range [1, N]; the upper clamp
+            # also absorbs a possible +1 overshoot from float rounding in the
+            # ceil above.
+            k = max(1, min(k, H * W))
             
             # torch.kthvalue is 1-indexed and returns the k-th SMALLEST
             # value, which is exactly the p-th percentile for the rank k
@@ -401,7 +416,9 @@ class RawToLogAttenuation(nn.Module):
         
         # Step 5: Compute log-attenuation
         # L = -ln(T) = -ln(I/I_0) = ln(I_0) - ln(I)
-        # For T ∈ [epsilon, 1], L ∈ [0, -ln(epsilon)] ≈ [0, 13.8]
+        # For T ∈ [epsilon, 1], L ∈ [0, -ln(epsilon)], which is ≈ [0, 13.8]
+        # at the DEFAULT epsilon=1e-6. (13.8 nepers here, not an HVL count —
+        # see the epsilon docstring above.)
         log_attenuation = -torch.log(transmission)
         
         if return_debug:
@@ -451,8 +468,10 @@ def numpy_to_log_attenuation(
     Args:
         img_low: Low energy image (H, W), dtype=uint16 or float
         img_high: High energy image (H, W), dtype=uint16 or float
-        epsilon: Minimum transmission ratio (must be in (0, 1])
-        gaussian_sigma: Sigma for pre-log Gaussian blur (0 to disable, must be >= 0)
+        epsilon: Minimum transmission ratio (must be in (0, 1); 1 would erase
+            all attenuation)
+        gaussian_sigma: Sigma for pre-log Gaussian blur (0 to disable; must be
+            finite and >= 0)
         
     Returns:
         L_low: Log-attenuation of low energy image
@@ -460,15 +479,18 @@ def numpy_to_log_attenuation(
         stats: Dictionary of calibration statistics
     """
     # Input validation, mirroring RawToLogAttenuation.__init__ (Refs #5).
-    if not (0 < epsilon <= 1.0):
+    if not (0 < epsilon < 1.0):
         raise ValueError(
-            f"epsilon must be in (0, 1], got {epsilon}. epsilon <= 0 leaves "
-            "0/0 -> NaN for an all-black image; epsilon > 1 makes the clip "
-            "bounds [epsilon, 1.0] invalid."
+            f"epsilon must be in (0, 1), got {epsilon}. epsilon <= 0 (or NaN) "
+            "leaves 0/0 -> NaN for an all-black image; epsilon == 1 collapses "
+            "the clip to [1, 1], erasing all attenuation; epsilon > 1 makes "
+            "the clip bounds [epsilon, 1.0] invalid."
         )
-    if gaussian_sigma < 0:
+    # NaN compares False against both < 0 and > 0, so without the isfinite
+    # test it would slip through and silently disable the blur below.
+    if not math.isfinite(gaussian_sigma) or gaussian_sigma < 0:
         raise ValueError(
-            f"gaussian_sigma must be >= 0, got {gaussian_sigma} "
+            f"gaussian_sigma must be finite and >= 0, got {gaussian_sigma} "
             "(exactly 0 disables the blur)."
         )
 
