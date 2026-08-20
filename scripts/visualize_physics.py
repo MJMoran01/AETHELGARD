@@ -50,6 +50,34 @@ def setup_output_dir() -> Path:
     return output_dir
 
 
+def get_preprocessed_sample(dataset: DualEnergyDataset, idx: int) -> torch.Tensor:
+    """
+    Load raw images for a dataset index and run them through the REAL
+    preprocessing module (RawToLogAttenuation), rather than
+    DualEnergyDataset's separate NumPy conversion path (which has no
+    Gaussian denoising). Shared by every caller that needs a preprocessed
+    (2, H, W) log-attenuation tensor for this validation script, so the
+    real preprocessing module is exercised everywhere, not just for the
+    first sample.
+
+    Returns:
+        L_tensor: (2, H, W) log-attenuation tensor.
+    """
+    img_lo, img_hi = dataset.get_raw_pair(idx)
+    raw_tensor = torch.from_numpy(
+        np.stack([img_lo, img_hi], axis=0)
+    ).unsqueeze(0).float()  # (1, 2, H, W)
+
+    preprocessor = RawToLogAttenuation(
+        epsilon=dataset.epsilon,
+        gaussian_sigma=1.0,
+        i0_method=dataset.i0_method,
+    )
+    with torch.no_grad():
+        L_batch = preprocessor(raw_tensor)  # (1, 2, H, W)
+    return L_batch.squeeze(0)  # (2, H, W)
+
+
 def visualize_raw_images(
     dataset: DualEnergyDataset,
     idx: int = 0,
@@ -138,22 +166,9 @@ def visualize_log_attenuation(
     """
     print(f"\n[2] Visualizing log-attenuation (sample {idx})...")
 
-    # Get raw (unprocessed) images and run them through the real
-    # preprocessing module, matching how the production pipeline (and
-    # demo_debug.py) constructs log-attenuation from raw intensity.
-    img_lo, img_hi = dataset.get_raw_pair(idx)
-    raw_tensor = torch.from_numpy(
-        np.stack([img_lo, img_hi], axis=0)
-    ).unsqueeze(0).float()  # (1, 2, H, W)
-
-    preprocessor = RawToLogAttenuation(
-        epsilon=dataset.epsilon,
-        gaussian_sigma=1.0,
-        i0_method=dataset.i0_method,
-    )
-    with torch.no_grad():
-        L_batch = preprocessor(raw_tensor)  # (1, 2, H, W)
-    L_tensor = L_batch.squeeze(0)  # (2, H, W)
+    # Get preprocessed sample via the real preprocessing module (see
+    # get_preprocessed_sample docstring for why not dataset[idx]).
+    L_tensor = get_preprocessed_sample(dataset, idx)
 
     L_low = L_tensor[0].numpy()
     L_high = L_tensor[1].numpy()
@@ -405,8 +420,7 @@ def visualize_comparison(
     fig.suptitle('Physics Maps Comparison Across Samples', fontsize=14, fontweight='bold')
     
     for row, idx in enumerate(indices):
-        sample = dataset[idx]
-        L_tensor = sample['image']
+        L_tensor = get_preprocessed_sample(dataset, idx)
         
         with torch.no_grad():
             physics_maps = physics_head(L_tensor.unsqueeze(0))
