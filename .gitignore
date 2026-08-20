@@ -41,11 +41,14 @@ env/
 *.pt
 checkpoints/
 
-# Data files (too large for git)
+# Data files (too large for git, license/redistribution unverified —
+# AGENTS.md domain constraint 4)
 # Keep the dataset structure but not the actual images
 HUMS-X-ray-Dataset/HighLow/*.tif
+HUMS-X-ray-Dataset/NotThreats/*.tif
 HUMS-X-ray-Dataset/NotThreats/*.png
 HUMS-X-ray-Dataset/NotThreats/*.jpg
+HUMS-X-ray-Dataset/ThreatsRGB/*.tif
 HUMS-X-ray-Dataset/ThreatsRGB/*.png
 HUMS-X-ray-Dataset/ThreatsRGB/*.jpg
 
@@ -64,3 +67,15 @@ logs/
 # Temporary files
 tmp/
 temp/
+
+# Credentials (AGENTS.md domain constraint 3 — never write these to a
+# tracked file)
+.env
+.env.*
+credentials.json
+*-service-account*.json
+*.pem
+*.key
+
+# Per-task git worktrees (agent workflow)
+.claude/worktrees/
