@@ -58,7 +58,14 @@ def load_tif_image(path: str) -> np.ndarray:
         Image as numpy array (H, W), dtype depends on source
     """
     if HAS_TIFFFILE:
-        img = tifffile.imread(path)
+        with tifffile.TiffFile(path) as tif:
+            if len(tif.pages) != 1:
+                raise ValueError(
+                    f"Expected a single-page grayscale TIF image at {path!r}, "
+                    f"but found {len(tif.pages)} pages/frames. Multipage TIFs "
+                    f"are not supported by this dataset loader."
+                )
+            img = tif.pages[0].asarray()
     else:
         with Image.open(path) as pil_img:
             n_frames = getattr(pil_img, "n_frames", 1)
