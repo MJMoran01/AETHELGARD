@@ -24,8 +24,6 @@ before feeding to the PhysicsHead.
 Author: Michael Moran
 """
 
-import os
-import re
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict, Callable
 

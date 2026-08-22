@@ -61,7 +61,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 # Import scipy for Gaussian filtering
 try:

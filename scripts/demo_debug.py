@@ -27,9 +27,7 @@ Supervisor: Dr. Thomas Anthony, CTO, Analytical AI
 """
 
 import sys
-import os
 from pathlib import Path
-from datetime import datetime
 import argparse
 
 # Add parent directory to path for imports
@@ -403,9 +401,6 @@ def plot_04_aspace_scatter(A1: np.ndarray, A2: np.ndarray,
     
     # θ_min line: A1/A2 = tan(θ_min)
     a2_line = np.linspace(0, r_max, 100)
-    a1_min = a2_line * np.tan(theta_min)
-    a1_max = a2_line * np.tan(theta_max)
-    
     ax.plot(a2_line * np.cos(theta_min), a2_line * np.sin(theta_min), 
             'r--', linewidth=2, label=f'θ_min={theta_min:.2f} rad')
     ax.plot(a2_line * np.cos(theta_max), a2_line * np.sin(theta_max), 
