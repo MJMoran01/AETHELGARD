@@ -57,6 +57,10 @@ We clamp the transmission ratio T = I/I_0 to the range [epsilon, 1.0]:
 Author: Michael Moran
 """
 
+import math
+import operator
+from fractions import Fraction
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,17 +83,52 @@ def create_gaussian_kernel(sigma: float, kernel_size: int = None) -> torch.Tenso
     This is a pure PyTorch implementation for GPU compatibility.
     
     Args:
-        sigma: Standard deviation of the Gaussian
-        kernel_size: Size of the kernel (must be odd). If None, auto-computed.
+        sigma: Standard deviation of the Gaussian (must be > 0)
+        kernel_size: Size of the kernel (must be odd and >= 1). If None,
+            auto-computed from sigma.
+
+    Raises:
+        TypeError: if kernel_size is not an integer (a non-integral size
+            silently changes the kernel's extent).
+        ValueError: if sigma is non-finite or <= 0 (the Gaussian is undefined
+            and 1/(2*sigma**2) divides by zero), or if kernel_size is < 1 or
+            even. An even kernel
+            has no centre tap, and padding it by kernel_size // 2 would change
+            the convolution's output size instead of preserving it.
         
     Returns:
         Gaussian kernel tensor of shape (1, 1, kernel_size, kernel_size)
     """
+    if not math.isfinite(sigma) or sigma <= 0:
+        raise ValueError(
+            f"sigma must be finite and > 0 to define a Gaussian kernel, got "
+            f"{sigma}. To disable blurring, do not build a kernel at all."
+        )
+
     if kernel_size is None:
         # Rule of thumb: kernel should span ~3 sigma on each side
         kernel_size = int(6 * sigma + 1)
         if kernel_size % 2 == 0:
             kernel_size += 1  # Ensure odd size
+    else:
+        # operator.index rejects floats (and NaN/inf) outright. A non-integral
+        # size would otherwise pass both checks below and silently change the
+        # kernel's extent: torch.arange(3.5) has FOUR elements, i.e. an even
+        # kernel, which then breaks size preservation. The auto-computed
+        # branch above already yields an int, so this check belongs here only.
+        try:
+            kernel_size = operator.index(kernel_size)
+        except TypeError as exc:
+            raise TypeError(
+                f"kernel_size must be an integer, got {kernel_size!r}."
+            ) from exc
+        if kernel_size < 1:
+            raise ValueError(f"kernel_size must be >= 1, got {kernel_size}")
+        if kernel_size % 2 == 0:
+            raise ValueError(
+                f"kernel_size must be odd, got {kernel_size}. Only an odd "
+                "kernel is size-preserving under padding = kernel_size // 2."
+            )
     
     # Create 1D Gaussian
     x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2
@@ -139,7 +178,8 @@ class RawToLogAttenuation(nn.Module):
         gaussian_sigma: float = 1.0,
         i0_method: str = "per_image_max",
         i0_percentile: float = 99.5,
-        max_bit_depth: int = 16
+        max_bit_depth: int = 16,
+        blur_padding_mode: str = "reflect"
     ):
         """
         Initialize the preprocessing layer.
@@ -148,7 +188,12 @@ class RawToLogAttenuation(nn.Module):
             epsilon: Minimum transmission ratio to prevent log(0). 
                      Physics justification: Even in dense regions, some
                      photons scatter through. epsilon=1e-6 corresponds to
-                     ~14 half-value layers of attenuation.
+                     ~19.9 half-value layers of attenuation:
+                     HVLs = log2(1 / 1e-6) = log2(1e6) = 19.93.
+                     (-ln(1e-6) = 13.8 is the natural-log attenuation depth,
+                     NOT an HVL count; the two differ by the factor ln(2).)
+                     Must be in (0, 1): epsilon == 1 would clamp every
+                     pixel to transmission 1 and erase all attenuation.
             gaussian_sigma: Standard deviation for pre-log Gaussian blur.
                            Set to 0 to disable blur. Default 1.0 pixels.
                            Physics justification: Averages out Poisson shot
@@ -157,18 +202,76 @@ class RawToLogAttenuation(nn.Module):
                 - "per_image_max": Use max pixel value in each image
                 - "per_image_percentile": Use percentile (more robust to hot pixels)
                 - "global": Use theoretical max (2^bit_depth - 1)
-            i0_percentile: Percentile to use if i0_method="per_image_percentile"
+            i0_percentile: Percentile to use if i0_method="per_image_percentile".
+                           Must be in (0, 100].
             max_bit_depth: Bit depth of input images (16 for our TIFs)
+            blur_padding_mode: Boundary handling for the pre-log Gaussian blur.
+                           One of "reflect" (default), "replicate", or
+                           "constant". "constant" is zero padding, which
+                           fabricates attenuation at the image border; it is
+                           retained only as an explicit opt-in.
+
+        Raises:
+            ValueError: for epsilon outside (0, 1), a non-finite or negative
+                gaussian_sigma,
+                i0_percentile outside (0, 100], or an unknown
+                blur_padding_mode.
         """
         super().__init__()
+
+        # Input validation. These parameters exist to PROVIDE numerical
+        # protection, so a value that silently disables that protection is a
+        # configuration error, not a configuration. (Refs #5, findings 3-4.)
+        if not (0 < epsilon < 1.0):
+            raise ValueError(
+                f"epsilon must be in (0, 1), got {epsilon}. epsilon <= 0 (or "
+                "NaN) leaves 0/0 -> NaN for an all-black image and admits log "
+                "of a non-positive number; epsilon == 1 collapses the clamp to "
+                "[1, 1], erasing all attenuation; epsilon > 1 makes the clamp "
+                "bounds [epsilon, 1.0] invalid (min > max)."
+            )
+        # math.isfinite is required as well as the sign test: NaN compares
+        # False against both < 0 and > 0, so an unchecked NaN would slip
+        # through here and then silently DISABLE the blur below.
+        if not math.isfinite(gaussian_sigma) or gaussian_sigma < 0:
+            raise ValueError(
+                f"gaussian_sigma must be finite and >= 0, got "
+                f"{gaussian_sigma} (exactly 0 disables the blur)."
+            )
+        if not (0 < i0_percentile <= 100):
+            raise ValueError(
+                f"i0_percentile must be in (0, 100], got {i0_percentile}."
+            )
+        # Validate the value that will actually be STORED, not only the Python
+        # float that was passed. The buffer is float32, where 1e-46 rounds to
+        # 0.0 (restoring the division by zero this parameter exists to prevent)
+        # and 0.99999999 rounds to 1.0 (collapsing the clamp to [1, 1] and
+        # erasing all attenuation). numpy_to_log_attenuation needs no
+        # equivalent read-back: it keeps the caller's float64 value unchanged.
+        epsilon_buffer = torch.tensor(epsilon, dtype=torch.float32)
+        epsilon_stored = float(epsilon_buffer)
+        if not (0 < epsilon_stored < 1.0):
+            raise ValueError(
+                f"epsilon={epsilon} is stored as {epsilon_stored} in float32, "
+                "which is outside (0, 1). Choose a value that survives the "
+                "float32 round trip."
+            )
+
+        valid_padding_modes = ("reflect", "replicate", "constant")
+        if blur_padding_mode not in valid_padding_modes:
+            raise ValueError(
+                f"blur_padding_mode must be one of {valid_padding_modes}, "
+                f"got {blur_padding_mode!r}."
+            )
         
         # Store as buffers (not parameters - these don't get gradients)
-        self.register_buffer("epsilon", torch.tensor(epsilon))
+        self.register_buffer("epsilon", epsilon_buffer)
         self.register_buffer("global_i0", torch.tensor(2**max_bit_depth - 1, dtype=torch.float32))
         
         self.gaussian_sigma = gaussian_sigma
         self.i0_method = i0_method
         self.i0_percentile = i0_percentile
+        self.blur_padding_mode = blur_padding_mode
         
         # Pre-compute Gaussian kernel if sigma > 0
         if self.gaussian_sigma > 0:
@@ -217,7 +320,17 @@ class RawToLogAttenuation(nn.Module):
         blurred_channels = []
         for c in range(C):
             channel = x[:, c:c+1, :, :]  # (B, 1, H, W)
-            blurred = F.conv2d(channel, kernel, padding=padding)
+            # Pad EXPLICITLY rather than relying on conv2d's implicit zero
+            # padding: zeros outside the frame read as "no photons arrived",
+            # which fabricates attenuation at the image border. Reflective
+            # padding (the default here, matching the boundary-extension
+            # family used by the scipy.ndimage path) extends the image with
+            # its own edge content instead.
+            padded = F.pad(
+                channel, (padding, padding, padding, padding),
+                mode=self.blur_padding_mode
+            )
+            blurred = F.conv2d(padded, kernel)
             blurred_channels.append(blurred)
         
         return torch.cat(blurred_channels, dim=1)
@@ -249,12 +362,30 @@ class RawToLogAttenuation(nn.Module):
             x_flat = x.view(B, C, -1)  # (B, C, H*W)
             
             # Compute percentile along spatial dimension
-            k = int((self.i0_percentile / 100.0) * (H * W))
-            k = max(1, min(k, H * W - 1))  # Clamp to valid range
+            # Nearest-rank convention: rank = ceil(p/100 * N), so p=50 over
+            # N=5 gives rank 3 (the median) rather than the rank-2 value that
+            # truncation would return.
+            #
+            # The percentile is interpreted as the DECIMAL the caller wrote,
+            # via Fraction(str(...)), not as its binary float image: in binary
+            # floating point (99.9 / 100) * 10000 is 9990.000000000002, whose
+            # ceil is 9991 - one rank too high. Fraction(99.9) does not help
+            # either, since the exact binary value of the literal is likewise
+            # above 99.9; only the decimal string gives 999/10 and hence
+            # exactly 9990.
+            k = math.ceil(Fraction(str(float(self.i0_percentile))) * (H * W) / 100)
+            # Clamp to the valid 1-indexed rank range [1, N]; the upper clamp
+            # also absorbs a possible +1 overshoot from float rounding in the
+            # ceil above.
+            k = max(1, min(k, H * W))
             
-            # torch.kthvalue returns (values, indices)
-            # We want the k-th largest, so use (total - k)-th smallest
-            i0, _ = x_flat.kthvalue(H * W - k + 1, dim=-1, keepdim=True)
+            # torch.kthvalue is 1-indexed and returns the k-th SMALLEST
+            # value, which is exactly the p-th percentile for the rank k
+            # computed above: for p=99.5 over N=10000 pixels, k=9950, i.e. the
+            # 9950th-smallest value. The previous `H * W - k + 1` form
+            # inverted the direction and returned the (100-p)-th percentile
+            # (rank 51 of 10000) instead.
+            i0, _ = x_flat.kthvalue(k, dim=-1, keepdim=True)
             return i0.unsqueeze(-1)  # (B, C, 1, 1)
             
         else:
@@ -323,7 +454,9 @@ class RawToLogAttenuation(nn.Module):
         
         # Step 5: Compute log-attenuation
         # L = -ln(T) = -ln(I/I_0) = ln(I_0) - ln(I)
-        # For T ∈ [epsilon, 1], L ∈ [0, -ln(epsilon)] ≈ [0, 13.8]
+        # For T ∈ [epsilon, 1], L ∈ [0, -ln(epsilon)], which is ≈ [0, 13.8]
+        # at the DEFAULT epsilon=1e-6. (13.8 nepers here, not an HVL count —
+        # see the epsilon docstring above.)
         log_attenuation = -torch.log(transmission)
         
         if return_debug:
@@ -373,14 +506,32 @@ def numpy_to_log_attenuation(
     Args:
         img_low: Low energy image (H, W), dtype=uint16 or float
         img_high: High energy image (H, W), dtype=uint16 or float
-        epsilon: Minimum transmission ratio
-        gaussian_sigma: Sigma for pre-log Gaussian blur (0 to disable)
+        epsilon: Minimum transmission ratio (must be in (0, 1); 1 would erase
+            all attenuation)
+        gaussian_sigma: Sigma for pre-log Gaussian blur (0 to disable; must be
+            finite and >= 0)
         
     Returns:
         L_low: Log-attenuation of low energy image
         L_high: Log-attenuation of high energy image
         stats: Dictionary of calibration statistics
     """
+    # Input validation, mirroring RawToLogAttenuation.__init__ (Refs #5).
+    if not (0 < epsilon < 1.0):
+        raise ValueError(
+            f"epsilon must be in (0, 1), got {epsilon}. epsilon <= 0 (or NaN) "
+            "leaves 0/0 -> NaN for an all-black image; epsilon == 1 collapses "
+            "the clip to [1, 1], erasing all attenuation; epsilon > 1 makes "
+            "the clip bounds [epsilon, 1.0] invalid."
+        )
+    # NaN compares False against both < 0 and > 0, so without the isfinite
+    # test it would slip through and silently disable the blur below.
+    if not math.isfinite(gaussian_sigma) or gaussian_sigma < 0:
+        raise ValueError(
+            f"gaussian_sigma must be finite and >= 0, got {gaussian_sigma} "
+            "(exactly 0 disables the blur)."
+        )
+
     # Convert to float64 for precision
     img_low = img_low.astype(np.float64)
     img_high = img_high.astype(np.float64)
