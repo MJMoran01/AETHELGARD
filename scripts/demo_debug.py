@@ -50,6 +50,8 @@ from aethelgard.physics_head import PhysicsHead, ASpaceNoiseFilter
 # ==============================================================================
 EPSILON = 1e-6
 Z_SCALE = 10.0  # Match PhysicsHead default
+PLOT_SAMPLING_SEED = 42  # Fixed seed for scatter-plot subsampling, so committed
+                          # debug artifacts are reproducible across re-runs.
 
 # Material Z values for histogram markers
 Z_MARKERS = {
@@ -323,7 +325,8 @@ def plot_03_bhc_comparison(L_low: np.ndarray, L_high: np.ndarray,
     
     # Scatter: Naive vs BHC
     ax = axes[1, 1]
-    sample_idx = np.random.choice(Z_naive.size, min(10000, Z_naive.size), replace=False)
+    rng = np.random.default_rng(PLOT_SAMPLING_SEED)
+    sample_idx = rng.choice(Z_naive.size, min(10000, Z_naive.size), replace=False)
     ax.scatter(Z_naive.ravel()[sample_idx], Z_eff_bhc.ravel()[sample_idx], 
                alpha=0.1, s=1)
     ax.plot([0, 40], [0, 40], 'r--', label='y=x')
@@ -377,7 +380,8 @@ def plot_04_aspace_scatter(A1: np.ndarray, A2: np.ndarray,
     n_points = A1.size
     max_plot = 50000
     if n_points > max_plot:
-        idx = np.random.choice(n_points, max_plot, replace=False)
+        rng = np.random.default_rng(PLOT_SAMPLING_SEED)
+        idx = rng.choice(n_points, max_plot, replace=False)
         A1_plot = A1.ravel()[idx]
         A2_plot = A2.ravel()[idx]
     else:
@@ -481,11 +485,15 @@ def plot_06_pseudocolor(Z_eff: np.ndarray, output_dir: Path):
     
     cbar = plt.colorbar(im, ax=ax, fraction=0.046)
     cbar.set_label('Z_eff')
-    cbar.ax.axhline(y=ORGANIC_MAX/30, color='black', linewidth=2)
-    cbar.ax.axhline(y=INORGANIC_MAX/30, color='black', linewidth=2)
-    cbar.ax.text(1.5, ORGANIC_MAX/30, 'Organics', fontsize=8, va='center')
-    cbar.ax.text(1.5, (ORGANIC_MAX+INORGANIC_MAX)/60, 'Inorganics', fontsize=8, va='center')
-    cbar.ax.text(1.5, (INORGANIC_MAX+30)/60, 'Metals', fontsize=8, va='center')
+    # The colorbar's own axes are in DATA coordinates (0-30, matching
+    # vmin/vmax above), not normalized [0, 1] fractions -- so boundary
+    # lines/text must use the raw Z-value scale to line up with the
+    # colorbar's own tick labels.
+    cbar.ax.axhline(y=ORGANIC_MAX, color='black', linewidth=2)
+    cbar.ax.axhline(y=INORGANIC_MAX, color='black', linewidth=2)
+    cbar.ax.text(1.5, ORGANIC_MAX / 2, 'Organics', fontsize=8, va='center')
+    cbar.ax.text(1.5, (ORGANIC_MAX + INORGANIC_MAX) / 2, 'Inorganics', fontsize=8, va='center')
+    cbar.ax.text(1.5, (INORGANIC_MAX + 30) / 2, 'Metals', fontsize=8, va='center')
     
     plt.tight_layout()
     save_path = output_dir / '06_pseudocolor.png'
@@ -494,7 +502,7 @@ def plot_06_pseudocolor(Z_eff: np.ndarray, output_dir: Path):
     print(f"  Saved: {save_path}")
 
 
-def plot_07_sanity_check(L_low, L_high, Z_eff, A1, A2, output_dir: Path):
+def plot_07_sanity_check(L_low, L_high, Z_eff, A1, A2, grad_R, output_dir: Path):
     """Panel 7: Physics sanity check summary."""
     fig, ax = plt.subplots(figsize=(10, 8))
     fig.suptitle('07. Physics Sanity Check', fontsize=14, fontweight='bold')
@@ -533,6 +541,13 @@ def plot_07_sanity_check(L_low, L_high, Z_eff, A1, A2, output_dir: Path):
         checks.append(('✓', 'A₁, A₂ non-negative (physical)', 'green'))
     else:
         checks.append(('✗', 'Negative A₁ or A₂ detected!', 'red'))
+
+    # Check 6: grad_R (ratio-gradient channel) finite, no NaN/Inf
+    has_grad_r_nan_inf = np.isnan(grad_R).any() or np.isinf(grad_R).any()
+    if not has_grad_r_nan_inf:
+        checks.append(('✓', f'grad_R finite (no NaN/Inf), range=[{grad_R.min():.3f}, {grad_R.max():.3f}]', 'green'))
+    else:
+        checks.append(('✗', 'NaN or Inf detected in grad_R!', 'red'))
     
     # Display checks
     y_pos = 0.9
@@ -550,6 +565,7 @@ def plot_07_sanity_check(L_low, L_high, Z_eff, A1, A2, output_dir: Path):
         f"Z_eff:  range=[{Z_eff.min():.1f}, {Z_eff.max():.1f}], mean={Z_eff.mean():.1f}\n"
         f"A₁:     range=[{A1.min():.3f}, {A1.max():.3f}]\n"
         f"A₂:     range=[{A2.min():.3f}, {A2.max():.3f}]\n"
+        f"grad_R: range=[{grad_R.min():.3f}, {grad_R.max():.3f}], mean={grad_R.mean():.3f}\n"
     )
     ax.text(0.1, 0.35, stats_text, transform=ax.transAxes, fontsize=10, family='monospace')
     
@@ -593,6 +609,7 @@ def run_debug_pipeline(lo_path: str, hi_path: str):
     A1 = physics_debug['A1'][0, 0].numpy()
     A2 = physics_debug['A2'][0, 0].numpy()
     Z_eff = physics_debug['Z_eff'][0, 0].numpy()
+    grad_R = physics_debug['grad_R'][0, 0].numpy()
     
     # Step 4: A-space filtering (optional, for diagnostics)
     print("\n[4/7] Running A-space noise filter...")
@@ -609,7 +626,7 @@ def run_debug_pipeline(lo_path: str, hi_path: str):
     plot_04_aspace_scatter(A1, A2, filter_diag[0] if filter_diag else {}, output_dir)
     plot_05_zeff_histogram(Z_eff, L_low, output_dir)
     plot_06_pseudocolor(Z_eff, output_dir)
-    plot_07_sanity_check(L_low, L_high, Z_eff, A1, A2, output_dir)
+    plot_07_sanity_check(L_low, L_high, Z_eff, A1, A2, grad_R, output_dir)
     
     print("\n" + "=" * 70)
     print("DEBUG VISUALIZATION COMPLETE")
@@ -635,3 +652,7 @@ if __name__ == "__main__":
             run_debug_pipeline(lo_path, hi_path)
         else:
             print("No image files found. Please specify --lo and --hi paths.")
+            raise FileNotFoundError(
+                f"No *_lo.tif files found in {data_dir}; "
+                "specify --lo/--hi explicitly."
+            )

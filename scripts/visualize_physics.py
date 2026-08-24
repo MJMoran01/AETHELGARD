@@ -48,6 +48,34 @@ def setup_output_dir() -> Path:
     return output_dir
 
 
+def get_preprocessed_sample(dataset: DualEnergyDataset, idx: int) -> torch.Tensor:
+    """
+    Load raw images for a dataset index and run them through the REAL
+    preprocessing module (RawToLogAttenuation), rather than
+    DualEnergyDataset's separate NumPy conversion path (which has no
+    Gaussian denoising). Shared by every caller that needs a preprocessed
+    (2, H, W) log-attenuation tensor for this validation script, so the
+    real preprocessing module is exercised everywhere, not just for the
+    first sample.
+
+    Returns:
+        L_tensor: (2, H, W) log-attenuation tensor.
+    """
+    img_lo, img_hi = dataset.get_raw_pair(idx)
+    raw_tensor = torch.from_numpy(
+        np.stack([img_lo, img_hi], axis=0)
+    ).unsqueeze(0).float()  # (1, 2, H, W)
+
+    preprocessor = RawToLogAttenuation(
+        epsilon=dataset.epsilon,
+        gaussian_sigma=1.0,
+        i0_method=dataset.i0_method,
+    )
+    with torch.no_grad():
+        L_batch = preprocessor(raw_tensor)  # (1, 2, H, W)
+    return L_batch.squeeze(0)  # (2, H, W)
+
+
 def visualize_raw_images(
     dataset: DualEnergyDataset,
     idx: int = 0,
@@ -128,13 +156,18 @@ def visualize_log_attenuation(
 ):
     """
     Visualize log-attenuation images after preprocessing.
+
+    Runs the REAL preprocessing module (RawToLogAttenuation) rather than
+    the dataset's separate NumPy conversion path, so this validates the
+    actual pipeline (including Gaussian denoising) that feeds PhysicsHead
+    in production.
     """
     print(f"\n[2] Visualizing log-attenuation (sample {idx})...")
-    
-    # Get preprocessed sample
-    sample = dataset[idx]
-    L_tensor = sample['image']  # (2, H, W)
-    
+
+    # Get preprocessed sample via the real preprocessing module (see
+    # get_preprocessed_sample docstring for why not dataset[idx]).
+    L_tensor = get_preprocessed_sample(dataset, idx)
+
     L_low = L_tensor[0].numpy()
     L_high = L_tensor[1].numpy()
     
@@ -385,8 +418,7 @@ def visualize_comparison(
     fig.suptitle('Physics Maps Comparison Across Samples', fontsize=14, fontweight='bold')
     
     for row, idx in enumerate(indices):
-        sample = dataset[idx]
-        L_tensor = sample['image']
+        L_tensor = get_preprocessed_sample(dataset, idx)
         
         with torch.no_grad():
             physics_maps = physics_head(L_tensor.unsqueeze(0))
@@ -453,7 +485,7 @@ def run_validation():
     if not data_dir.exists():
         print(f"\n✗ ERROR: HUMS dataset not found at {data_dir}")
         print("  Please ensure the dataset is in the correct location.")
-        return
+        raise FileNotFoundError(f"HUMS dataset not found at {data_dir}")
     
     # Load dataset
     print(f"\nLoading dataset from: {data_dir}")
@@ -465,7 +497,7 @@ def run_validation():
         )
     except Exception as e:
         print(f"✗ ERROR loading dataset: {e}")
-        return
+        raise
     
     # Print dataset stats
     print(f"\nDataset Statistics:")
